@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   peerjs:
-    image: peerjs/peerjs-server
+    image: peerjs/peerjs-server:1.1.0-rc.2
     container_name: filesync-peerjs
     restart: unless-stopped
 
