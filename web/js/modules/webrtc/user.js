@@ -64,8 +64,8 @@ export class User {
       const isSecure = window.isSecureContext && window.location.hostname !== 'localhost';
       this._peer = new Peer(peer_id, {
         host: window.location.hostname,
-        port: 9000,
-        path: "/",
+        port: isSecure ? 443 : 80,
+        path: "/peerjs",
         secure: isSecure,
         config: {
           iceServers: iceServers,

@@ -53,7 +53,6 @@ Open `docker-compose.yml` and replace **both occurrences** of `<SECRET_KEY>` wit
 To enable HTTPS, edit the `Caddyfile`:
 
 - Replace `localhost:80` with your domain (e.g., `filesync.app`).
-- Replace `http://localhost:9000` with your domain and port (e.g., `filesync.app:9000`).
 
 Caddy will automatically provision and renew SSL certificates for your domain.
 
@@ -62,10 +61,6 @@ Caddy will automatically provision and renew SSL certificates for your domain.
 ```
 filesync.app {
 	reverse_proxy filesync:80
-}
-
-filesync.app:9000 {
-	reverse_proxy peerjs:9000
 }
 ```
 

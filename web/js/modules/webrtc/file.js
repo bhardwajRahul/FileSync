@@ -136,8 +136,8 @@ export class File {
       const isSecure = window.isSecureContext && window.location.hostname !== 'localhost';
       const peer = new Peer(uuid, {
         host: window.location.hostname,
-        port: 9000,
-        path: "/",
+        port: isSecure ? 443 : 80,
+        path: "/peerjs",
         secure: isSecure,
         config: {
           iceServers: iceServers,

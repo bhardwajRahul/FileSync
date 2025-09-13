@@ -5,7 +5,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "9000:9000"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - filesync:/data
@@ -28,6 +27,7 @@ services:
   peerjs:
     image: peerjs/peerjs-server:1.1.0-rc.2
     container_name: filesync-peerjs
+    command: peerjs --path /peerjs
     restart: unless-stopped
 
   filesync:
