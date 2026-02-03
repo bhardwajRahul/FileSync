@@ -133,10 +133,10 @@ export class File {
       const uuid = await this._getUUID();
 
       // Create a new Peer instance
-      const isSecure = window.isSecureContext && window.location.hostname !== 'localhost';
+      const isSecure = window.location.protocol === 'https:';
       const peer = new Peer(uuid, {
         host: window.location.hostname,
-        port: isSecure ? 443 : 80,
+        port: parseInt(window.location.port) || (isSecure ? 443 : 80),
         path: "/peerjs",
         secure: isSecure,
         config: {
@@ -206,7 +206,6 @@ export class File {
 
       // Check if the connection to the remote peer is open
       if (conn.peerConnection != null && conn.peerConnection.iceConnectionState != 'disconnected') {
-        // const encryptedChunk = await this._encrypt(chunk, `PASSWORD_VALUE`)
         conn.send({"webrtc-file-transfer": {"file": chunk, "transferred": chunk.size, "position": position}})
       }
 
@@ -298,7 +297,6 @@ export class File {
     }
 
     // Store file chunk
-    // const decryptedChunk = await this._decrypt(data.file, `PASSWORD_VALUE`)
     this._chunks[data.position] = data.file
     this._transferred += data.transferred
 
@@ -389,58 +387,6 @@ export class File {
   // Emitted when there is an unexpected error in the data connection.
   _handleError(err) {
     console.error("An error occurred.", err)
-  }
-
-  // Function to encrypt a chunk of data with AES-GCM
-  async _encrypt(chunk, key) {
-    // Step 1: Encode the key
-    const encoder = new TextEncoder();
-    const keyData = encoder.encode(key);
-
-    // Step 2: Generate the IV
-    const ivBuffer = await crypto.subtle.digest('SHA-256', keyData);
-    const iv = new Uint8Array(ivBuffer.slice(0, 12));
-
-    // Step 3: Import the key data as a CryptoKey object
-    const importedKey = await crypto.subtle.importKey('raw', keyData, { name: 'PBKDF2' }, false, ['deriveKey']);
-
-    // Step 4: Derive a fixed-size key using a Key Derivation Function (KDF)
-    const derivedKey = await crypto.subtle.deriveKey({name: 'PBKDF2', salt: new Uint8Array(ivBuffer), iterations: 100000, hash: 'SHA-256'}, importedKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
-
-    // Step 5: Convert the Blob chunk to an ArrayBuffer
-    const arrayBuffer = await chunk.arrayBuffer();
-
-    // Step 6: Encrypt the chunk with AES-GCM algorithm
-    const encryptedData = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, derivedKey, arrayBuffer);
-
-    // Step 7: Return the encrypted data as ArrayBuffer
-    return encryptedData;
-  }
-
-  // Function to decrypt a chunk of encrypted data with AES-GCM
-  async _decrypt(chunk, key) {
-    // Step 1: Encode the key
-    const encoder = new TextEncoder();
-    const keyData = encoder.encode(key);
-
-    // Step 2: Extract the IV and encrypted data
-    const ivBuffer = await crypto.subtle.digest('SHA-256', keyData);
-    const iv = new Uint8Array(ivBuffer.slice(0, 12));
-
-    // Step 3: Import the key data as a CryptoKey object
-    const importedKey = await crypto.subtle.importKey('raw', keyData, { name: 'PBKDF2' }, false, ['deriveKey']);
-
-    // Step 4: Derive a fixed-size key using a Key Derivation Function (KDF)
-    const derivedKey = await crypto.subtle.deriveKey({name: 'PBKDF2', salt: new Uint8Array(ivBuffer), iterations: 100000, hash: 'SHA-256'}, importedKey, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-
-    // Step 5: Decrypt the encrypted data with AES-GCM algorithm
-    const decryptedData = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, derivedKey, chunk);
-
-    // Step 6: Convert the decrypted ArrayBuffer to a Blob
-    const decryptedBlob = new Blob([decryptedData]);
-
-    // Step 7: Return the decrypted data as Blob
-    return decryptedBlob;
   }
 
   async _getUUID() {

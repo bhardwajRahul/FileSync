@@ -1,5 +1,6 @@
-# docker buildx build -t filesync:latest --compress --load .
-# docker buildx build --platform linux/amd64 -t filesync --compress --output=type=docker,dest=./filesync.tar .
+# Development
+# docker buildx build -t filesync:latest --load .
+# docker buildx build --platform linux/amd64 -t filesync --output=type=docker,dest=filesync.tar .
 
 # ==============================
 # Stage 1: Build Python dependencies

@@ -42,6 +42,15 @@ export class User {
     this._password = value
   }
 
+  async _hashPassword(password) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(password);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex;
+  }
+
   async init(peer_id = null) {
     // Get UUID
     if (peer_id == null) peer_id = await this._getUUID();
@@ -61,10 +70,10 @@ export class User {
 
     await new Promise((resolve) => {
       // Create a new Peer instance
-      const isSecure = window.isSecureContext && window.location.hostname !== 'localhost';
+      const isSecure = window.location.protocol === 'https:';
       this._peer = new Peer(peer_id, {
         host: window.location.hostname,
-        port: isSecure ? 443 : 80,
+        port: parseInt(window.location.port) || (isSecure ? 443 : 80),
         path: "/peerjs",
         secure: isSecure,
         config: {
@@ -444,7 +453,7 @@ export class User {
   }
 
   // Emitted when the connection is established and ready-to-use (a peer connects to the host).
-  _handleConnection(conn, resolve) {
+  async _handleConnection(conn, resolve) {
     // console.log('Received connection from', conn.peer)
 
     // Emitted when data is received from the remote peer. 
@@ -465,7 +474,8 @@ export class User {
         conn.send({"webrtc-connect": {"name": this._name}})
       }
       else {
-        conn.send({"webrtc-connect": {"name": this._name, "password": CryptoJS.SHA3(this._password).toString(CryptoJS.enc.Hex)}})
+        const hashedPassword = await this._hashPassword(this._password);
+        conn.send({"webrtc-connect": {"name": this._name, "password": hashedPassword}})
       }
     }
 
@@ -481,7 +491,7 @@ export class User {
       if (this._password.length != 0 && !('password' in data['webrtc-connect'])) {
         conn.send({'webrtc-connect-response': {"status": "password_required"}})
       }
-      else if (this._password.length != 0 && CryptoJS.SHA3(this._password).toString(CryptoJS.enc.Hex) != data['webrtc-connect']['password']) {
+      else if (this._password.length != 0 && await this._hashPassword(this._password) != data['webrtc-connect']['password']) {
         conn.send({'webrtc-connect-response': {"status": "password_invalid"}})
       }
       else {
