@@ -117,10 +117,18 @@ export class User {
 
   // Change user's name
   changeName(value) {
+    // Check if name is empty
+    if (!value || value.length === 0) {
+      if (window.showToast) window.showToast('Name cannot be empty.', 'warning')
+      dom.name_modal_value.focus()
+      return
+    }
+
     // Check if there is another user with the same name
     const duplicated = Object.entries(this._remotePeers).some(([k, v]) => v.name == value && k != this._peer.id)
     if (duplicated) {
-      dom.name_modal_error.style.display = 'block'
+      if (window.showToast) window.showToast('This name already exists.', 'warning')
+      dom.name_modal_value.focus()
       return
     }
 
@@ -156,12 +164,23 @@ export class User {
     // Close modal
     const modal = bootstrap.Modal.getInstance(dom.name_modal);
     modal.hide()
+    if (window.showToast) window.showToast(`Name changed to ${this._name}.`)
   }
 
   // Add one or multiple file to be transferred to all peers
   async addFiles(files) {
     let data = []
+    const skippedNames = []
     for (const file of files) {
+      // Check for duplicate file (same name and size already shared by you)
+      const isDuplicate = Object.values(this._files).some(
+        (existing) => existing.name === file.name && existing.size === file.size && !existing.removed && existing.owner_id === this._peer.id
+      )
+      if (isDuplicate) {
+        skippedNames.push(file.name)
+        continue
+      }
+
       // Parse file
       const fileData = {
         "id": await this._getUUID(),
@@ -185,6 +204,22 @@ export class User {
       data.push({"id": f.id, "name": f.name, "size": f.size, "owner_id": f.owner_id, "owner_name": f.owner_name})
     }
 
+    // Show toast for added files
+    if (data.length > 0 && window.showToast) {
+      const msg = data.length === 1
+        ? `File "${data[0].name}" added.`
+        : `${data.length} files added.`
+      window.showToast(msg)
+    }
+
+    // Show toast for skipped duplicates
+    if (skippedNames.length > 0) {
+      const msg = skippedNames.length === 1
+        ? `File "${skippedNames[0]}" is already added.`
+        : `${skippedNames.length} files were already added.`
+      if (window.showToast) window.showToast(msg, 'warning')
+    }
+
     // Send file to all remote peers (If host, then all peers. If peer, then to the host)
     for (let peer of Object.values(this._remotePeers)) {
       if ('conn' in peer) peer.conn.send({"webrtc-file-add": data})
@@ -194,6 +229,7 @@ export class User {
   // Remove a file shared by you
   removeFile(fileId) {
     this._files[fileId]._aborted = true
+    this._files[fileId]._removed = true
 
     // Notify all peers
     for (let peer of Object.values(this._remotePeers)) {
@@ -206,6 +242,7 @@ export class User {
     document.getElementById(`file-${fileId}-icon-failed`).style.display = 'none'
     document.getElementById(`file-${fileId}-error`).style.display = 'block'
     document.getElementById(`file-${fileId}-error`).innerHTML = 'You have removed this file.'
+    if (window.showToast) window.showToast(`File "${this._files[fileId].name}" removed.`)
   }
 
   // Download a file shared by another peer
@@ -264,21 +301,34 @@ export class User {
     };
 
     // Update UI
-    dom.file_modal_table_empty.style.display = Object.values(details).length == 0 ? 'block' : 'none'
-    dom.file_modal_table.style.display = Object.values(details).length == 0 ? 'none' : 'table'
+    const hasDetails = Object.values(details).length > 0
+    dom.file_modal_table_empty.style.display = hasDetails ? 'none' : 'block'
+    dom.file_modal_table.style.display = hasDetails ? 'table' : 'none'
+    const tableWrap = document.getElementById('file-modal-table-wrap')
+    if (tableWrap) tableWrap.style.display = hasDetails ? 'block' : 'none'
 
     // Build table
     dom.file_modal_table.querySelector('tbody').innerHTML = ''
     for (let user of Object.values(details)) {
+      const statusColor = user.progress == 100 ? '#198754' : user.aborted ? '#DC3545' : '#0d6efd'
+      const statusLabel = user.progress == 100 ? 'Completed' : user.aborted ? 'Stopped' : 'In progress'
+      const statusBg = user.progress == 100 ? 'rgba(25,135,84,0.1)' : user.aborted ? 'rgba(220,53,69,0.1)' : 'rgba(13,110,253,0.1)'
       dom.file_modal_table.querySelector('tbody').innerHTML += `
         <tr>
-          <th scope="row">${user.user_name}</th>
-          <td>${user.progress}%</td>
-          <td>${user.progress == 100 ? 'Completed' : user.aborted ? 'Stopped' : 'In progress'}</td>
-          <td>
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="${user.online ? '#198754' : '#DC3545'}" class="bi bi-circle-fill" viewBox="0 0 16 16">
-              <circle cx="8" cy="8" r="8"/>
-            </svg>
+          <td style="padding:12px 16px; font-weight:500; font-size:14px; color:var(--color-h1); vertical-align:middle; border-bottom:1px solid var(--color-border);">${user.user_name}</td>
+          <td style="padding:12px 16px; vertical-align:middle; border-bottom:1px solid var(--color-border); min-width:120px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <div style="flex:1; height:6px; background-color:var(--color-card-header-bg); border-radius:3px; overflow:hidden;">
+                <div style="width:${user.progress}%; height:100%; background-color:${statusColor}; border-radius:3px; transition:width 0.3s ease;"></div>
+              </div>
+              <span style="font-size:13px; font-weight:500; color:var(--color-muted); min-width:32px; text-align:right;">${user.progress}%</span>
+            </div>
+          </td>
+          <td style="padding:12px 16px; vertical-align:middle; border-bottom:1px solid var(--color-border);">
+            <span style="display:inline-block; padding:3px 10px; font-size:12px; font-weight:600; color:${statusColor}; background-color:${statusBg}; border-radius:20px;">${statusLabel}</span>
+          </td>
+          <td style="padding:12px 16px; vertical-align:middle; text-align:center; border-bottom:1px solid var(--color-border);">
+            <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background-color:${user.online ? '#198754' : '#DC3545'}; box-shadow:0 0 0 3px ${user.online ? 'rgba(25,135,84,0.2)' : 'rgba(220,53,69,0.2)'};"></span>
           </td>
         </tr>
       `
@@ -302,10 +352,7 @@ export class User {
 
     // Check if at least there is a file to be downloaded
     if (files.length == 0) {
-      const modal = new bootstrap.Modal(dom.notification_modal)
-      dom.notification_modal_value.innerHTML = "There are no files to be downloaded."
-      modal.show()
-      setTimeout(() => modal.hide(), 2000)
+      if (window.showToast) window.showToast("There are no files to be downloaded.", 'warning')
       return
     }
 
@@ -314,10 +361,7 @@ export class User {
 
     // Show notification modal
     if (inProgress) {
-      const modal = new bootstrap.Modal(dom.notification_modal)
-      dom.notification_modal_value.innerHTML = "Files are still downloading."
-      modal.show()
-      setTimeout(() => modal.hide(), 2000)
+      if (window.showToast) window.showToast("Files are still downloading.", 'warning')
       return
     }
 
@@ -572,6 +616,7 @@ export class User {
       dom.transfer_div.style.display = 'block'
       dom.transfer_status_wait.style.display = 'none'
       dom.transfer_status_success.style.display = 'inline-block'
+      if (window.showToast) window.showToast('Connection established!')
 
       // Process Connected Peers
       for (let p of data['webrtc-peers']) {
@@ -779,14 +824,23 @@ export class User {
 
     // Update the number of users in the list
     dom.transfer_users_count.innerHTML = ` (${dom.transfer_users_list.querySelectorAll('li').length})`
+
+    // Show toast (skip for own user)
+    if (user.id != this._peer.id && window.showToast) window.showToast(`User ${user.name} joined.`)
   }
 
   _removeUserUI(user_id) {
+    // Get user name before removing
+    const userName = this._remotePeers[user_id]?.name || document.getElementById(`user-${user_id}-name`)?.textContent?.trim() || 'A user'
+
     // Remove user from the list
     document.getElementById(`user-${user_id}`).remove()
 
     // Update the number of users in the list
     dom.transfer_users_count.innerHTML = ` (${dom.transfer_users_list.querySelectorAll('li').length})`
+
+    // Show toast
+    if (window.showToast) window.showToast(`User ${userName} left.`, 'warning')
   }
 
   _addFileUI(file) {
@@ -813,7 +867,7 @@ export class User {
         </div>
   
         <div class="col d-flex flex-column" style="overflow-x: hidden; padding-left:0px;">
-          <div style="margin-bottom: 5px; font-size: 1rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left">
+          <div style="margin-bottom: 5px; font-size: 0.875rem; font-weight: 500; text-align: left; word-break: break-all;">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" class="bi bi-arrow-up-short" viewBox="0 0 16 16"; style="margin-top:-3px; margin-right:-3px; margin-left:-5px; display: ${file.owner_id == this._peer.id ? 'block-inline' : 'none'}">
             <path fill-rule="evenodd" d="M8 12a.5.5 0 0 0 .5-.5V5.707l2.146 2.147a.5.5 0 0 0 .708-.708l-3-3a.5.5 0 0 0-.708 0l-3 3a.5.5 0 1 0 .708.708L7.5 5.707V11.5a.5.5 0 0 0 .5.5z"/>
           </svg>
@@ -823,7 +877,7 @@ export class User {
           ${file.name}</div>
           <div style="color: #636979; font-size: .9rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; margin-bottom:1px"><span id="file-${file.id}-progress"></span><span id="file-${file.id}-info">${this._parseBytes(file.size)} | Sent by ${file.owner_id == this._peer.id ? `${file.owner_name} (You)` : file.owner_name }</span></div>
           <div id="file-${file.id}-error" style="color: #dc3545; font-size: .9rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; margin-top:5px; margin-bottom:4px; display:none"></div>
-          <div id="file-${file.id}-info" onclick="showFileDetails('${file.id}')" style="color: #0d6efd; font-size: .9rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; padding-top:5px; padding-bottom:4px; padding-right:4px; cursor:pointer; width:76px; display: ${file.owner_id == this._peer.id ? 'block' : 'none'}">See details</div>
+          <div id="file-${file.id}-details" onclick="showFileDetails('${file.id}')" style="color: #0d6efd; font-size: .9rem; font-weight: 500; text-align: left; padding-top:5px; padding-bottom:4px; padding-right:4px; cursor:pointer; display: ${file.owner_id == this._peer.id ? 'block' : 'none'}">See details</div>
         </div>
 
         <div id="file-${file.id}-remove" onclick="removeFile('${file.id}')" class="col-auto text-end" title="Remove file" style="cursor: pointer; display: ${file.owner_id == this._peer.id ? 'block-inline' : 'none'}">

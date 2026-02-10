@@ -59,7 +59,6 @@ export const dom = {
   // NAME MODAL
   name_modal: document.getElementById('name-modal'),
   name_modal_value: document.getElementById('name-modal-value'),
-  name_modal_error: document.getElementById('name-modal-error'),
 
   // FILE MODAL
   file_modal: document.getElementById('file-modal'),

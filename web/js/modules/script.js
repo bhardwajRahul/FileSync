@@ -127,6 +127,7 @@ function addPasswordSubmit() {
   const modal = bootstrap.Modal.getInstance(dom.password_modal);
   modal.hide()
   dom.transfer_status_protected.style.display = user.password.length == 0 ? 'none' : 'inline-block'
+  showToast(user.password.length == 0 ? 'Password removed.' : 'Password set.')
 }
 window.addPasswordSubmit = addPasswordSubmit;
 
@@ -147,7 +148,6 @@ window.connectWithPassword = connectWithPassword;
 // Change name
 function changeName() {
   dom.name_modal_value.value = ''
-  dom.name_modal_error.style.display = 'none'
 
   const modal = new bootstrap.Modal(dom.name_modal)
   modal.show()
@@ -178,16 +178,13 @@ function copyURL() {
     document.body.removeChild(textarea);
   }
 
-  const modal = new bootstrap.Modal(dom.notification_modal)
-  dom.notification_modal_value.innerHTML = "URL copied."
+  showToast("URL copied.")
   dom.transfer_url_copy.style.display = 'none'
   dom.transfer_url_success.style.display = 'flex'
-  modal.show()
 
   setTimeout(() => {
     dom.transfer_url_success.style.display = 'none'
     dom.transfer_url_copy.style.display = 'flex'
-    modal.hide()
   }, 1000)
 }
 window.copyURL = copyURL;
@@ -234,6 +231,77 @@ function cancelDownloadAll() {
 }
 window.cancelDownloadAll = cancelDownloadAll;
 
+// Toast notification
+let _toastTimeout = null;
+function showToast(message, type = 'success') {
+  const toast = document.getElementById('notification-toast')
+  const toastValue = document.getElementById('notification-toast-value')
+  const iconSuccess = document.getElementById('notification-toast-icon-success')
+  const iconWarning = document.getElementById('notification-toast-icon-warning')
+  if (!toast || !toastValue) return
+  toastValue.textContent = message
+  // Toggle icon based on type
+  if (iconSuccess && iconWarning) {
+    iconSuccess.style.display = type === 'warning' ? 'none' : 'inline'
+    iconWarning.style.display = type === 'warning' ? 'inline' : 'none'
+  }
+  // Clear any existing timeout
+  if (_toastTimeout) clearTimeout(_toastTimeout)
+  // Show
+  toast.style.opacity = '1'
+  toast.style.transform = 'translateX(-50%) translateY(0)'
+  // Auto-hide after 2s
+  _toastTimeout = setTimeout(() => {
+    toast.style.opacity = '0'
+    toast.style.transform = 'translateX(-50%) translateY(-100px)'
+  }, 2000)
+}
+window.showToast = showToast;
+
+// Drag and Drop on transfer-div
+function initDropZone() {
+  const transferDiv = document.getElementById('transfer-div')
+  if (!transferDiv) return
+
+  // Prevent browser default drag behavior globally
+  window.addEventListener('dragover', (e) => e.preventDefault())
+  window.addEventListener('drop', (e) => e.preventDefault())
+
+  let dragCounter = 0
+
+  transferDiv.addEventListener('dragenter', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter++
+    transferDiv.classList.add('drag-over')
+  })
+
+  transferDiv.addEventListener('dragover', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+  })
+
+  transferDiv.addEventListener('dragleave', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter--
+    if (dragCounter === 0) {
+      transferDiv.classList.remove('drag-over')
+    }
+  })
+
+  transferDiv.addEventListener('drop', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter = 0
+    transferDiv.classList.remove('drag-over')
+    const files = e.dataTransfer.files
+    if (files.length > 0) {
+      user.addFiles(files)
+    }
+  })
+}
+
 // Function to generate a random string in the format XXX-XXXX-XXX.
 function generateRoomID() {
   const length = 10
@@ -247,4 +315,7 @@ function generateRoomID() {
 }
 
 // On document loaded, execute onLoad() method.
-(() => onLoad())();
+(() => {
+  onLoad()
+  initDropZone()
+})();
