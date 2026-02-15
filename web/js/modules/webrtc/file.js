@@ -20,7 +20,9 @@ export class File {
   _zip = false;
   _in_progress = false;
   _aborted = false;
-  _removed = false
+  _removed = false;
+  _peerReconnectAttempts = 0;
+  _peerReconnectTimer = null;
 
   constructor(file) {
     this._id = file.id
@@ -146,10 +148,20 @@ export class File {
       });
 
       // Emitted when a connection to the PeerServer is established.
-      peer.on('open', (id) => this._handleOpen(id, resolve));
+      peer.on('open', (id) => {
+        this._peerReconnectAttempts = 0;
+        if (this._peerReconnectTimer) {
+          clearTimeout(this._peerReconnectTimer);
+          this._peerReconnectTimer = null;
+        }
+        this._handleOpen(id, resolve);
+      });
 
       // Emitted when a new data connection is established from a remote peer.
       peer.on('connection', (conn) => conn.on('open', () => this._handleConnection(conn)));
+
+      // Emitted when the peer is disconnected from the signaling server.
+      peer.on('disconnected', () => this._handlePeerDisconnected(peer));
 
       // Errors on the peer are almost always fatal and will destroy the peer.
       peer.on('error', (err) => this._handleError(err));
@@ -231,8 +243,28 @@ export class File {
 
   // Emitted when a connection to the PeerServer is established. 
   _handleOpen(id, resolve) {
-    // console.log('My file peer ID is', id)
     resolve()
+  }
+
+  // Handles disconnection from the PeerJS signaling server for file transfer peers.
+  _handlePeerDisconnected(peer) {
+    // Guard: skip if a reconnect timer is already pending
+    if (this._peerReconnectTimer) return;
+
+    const maxAttempts = 3;
+    if (this._peerReconnectAttempts >= maxAttempts) {
+      console.error(`File peer: failed to reconnect after ${maxAttempts} attempts.`);
+      return;
+    }
+
+    const delay = 1000 * Math.pow(2, this._peerReconnectAttempts);
+    this._peerReconnectAttempts++;
+    console.warn(`File peer disconnected. Reconnecting in ${delay}ms (attempt ${this._peerReconnectAttempts}/${maxAttempts})...`);
+
+    this._peerReconnectTimer = setTimeout(() => {
+      this._peerReconnectTimer = null;
+      if (!peer.destroyed) peer.reconnect();
+    }, delay);
   }
 
   // Emitted when the connection is established and ready-to-use. 
@@ -386,7 +418,12 @@ export class File {
 
   // Emitted when there is an unexpected error in the data connection.
   _handleError(err) {
-    console.error("An error occurred.", err)
+    // Recoverable signaling errors — handled by 'disconnected' event
+    if (['disconnected', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
+      console.warn(`File peer recoverable error (${err.type}).`);
+      return;
+    }
+    console.error('File peer error:', err);
   }
 
   async _getUUID() {

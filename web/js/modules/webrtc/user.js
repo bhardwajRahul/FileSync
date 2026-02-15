@@ -12,6 +12,8 @@ export class User {
   _files = {};
   _status;
   _downloadAll;
+  _reconnectAttempts = 0;
+  _reconnectTimer = null;
 
   constructor(room_id) {
     this._room_id = room_id;
@@ -83,10 +85,20 @@ export class User {
       });
 
       // Emitted when a connection to the PeerServer is established.
-      this._peer.on('open', () => this._handleOpen(resolve));
+      this._peer.on('open', () => {
+        this._reconnectAttempts = 0;
+        if (this._reconnectTimer) {
+          clearTimeout(this._reconnectTimer);
+          this._reconnectTimer = null;
+        }
+        this._handleOpen(resolve);
+      });
 
       // Emitted when a new data connection is established from a remote peer.
       this._peer.on('connection', (conn) => conn.on('open', () => this._handleConnection(conn)));
+
+      // Emitted when the peer is disconnected from the signaling server.
+      this._peer.on('disconnected', () => this._handleDisconnected());
 
       // Errors on the peer are almost always fatal and will destroy the peer.
       this._peer.on('error', (err) => this._handleError(err));
@@ -113,6 +125,53 @@ export class User {
   // Emitted when a connection to the PeerServer is established. 
   _handleOpen(resolve) {
     resolve()
+  }
+
+  // Handles disconnection from the PeerJS signaling server.
+  _handleDisconnected() {
+    if (this._peer.destroyed) return;
+    console.warn('Lost connection to PeerJS server. Attempting to reconnect...');
+    this._scheduleReconnect();
+  }
+
+  // Schedules a reconnection attempt with exponential backoff.
+  _scheduleReconnect() {
+    // Guard: skip if a reconnect timer is already pending
+    if (this._reconnectTimer) return;
+
+    // Cannot reconnect a destroyed peer
+    if (this._peer.destroyed) {
+      this._showFatalError('Lost connection to server. Please refresh the page.');
+      return;
+    }
+
+    const maxAttempts = 5;
+    if (this._reconnectAttempts >= maxAttempts) {
+      console.error(`Failed to reconnect after ${maxAttempts} attempts.`);
+      this._showFatalError('Lost connection to server. Please refresh the page.');
+      return;
+    }
+
+    const delay = 1000 * Math.pow(2, this._reconnectAttempts);
+    this._reconnectAttempts++;
+    console.log(`Reconnect attempt ${this._reconnectAttempts}/${maxAttempts} in ${delay}ms...`);
+
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (this._peer.destroyed) {
+        this._showFatalError('Lost connection to server. Please refresh the page.');
+        return;
+      }
+      this._peer.reconnect();
+    }, delay);
+  }
+
+  // Shows the fatal error page.
+  _showFatalError(message) {
+    dom.transfer_div.style.display = 'none';
+    dom.connect_div.style.display = 'none';
+    dom.error_div.style.display = 'block';
+    dom.error_message.innerHTML = message;
   }
 
   // Change user's name
@@ -686,7 +745,7 @@ export class User {
   _handleClose(conn) {
     // Peer: The host has closed the connection
     if (conn.peer == this._room_id) {
-      if (this._status == 'welcome') {
+      if (this._status?.status == 'welcome') {
         dom.transfer_div.style.display = 'none'
         dom.error_div.style.display = 'block'
         dom.error_message.innerHTML = 'Host user has been disconnected.'
@@ -730,11 +789,32 @@ export class User {
 
   // Emitted when there is an unexpected error in the data connection.
   _handleError(err) {
-    console.error('Connection error: ' + err)
-    dom.transfer_div.style.display = 'none'
-    dom.connect_div.style.display = 'none'
-    dom.error_div.style.display = 'block'
-    dom.error_message.innerHTML = err.type === 'browser-incompatible' ? 'FileSync does not work with this browser.' : err.message
+    // Fatal errors — cannot recover
+    const fatalTypes = ['browser-incompatible', 'invalid-id', 'unavailable-id', 'ssl-unavailable'];
+    if (fatalTypes.includes(err.type)) {
+      this._showFatalError(
+        err.type === 'browser-incompatible'
+          ? 'FileSync does not work with this browser.'
+          : err.message
+      );
+      return;
+    }
+
+    // Recoverable errors — attempt reconnection
+    if (['disconnected', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
+      console.warn(`Recoverable error (${err.type}). Scheduling reconnect...`);
+      this._scheduleReconnect();
+      return;
+    }
+
+    // Peer-unavailable is expected when a remote peer is unreachable
+    if (err.type === 'peer-unavailable') {
+      console.warn('Remote peer is unavailable:', err.message);
+      return;
+    }
+
+    // Fallback for unknown error types
+    console.error('Unhandled peer error:', err.type, err.message);
   }
 
   async _onFileAdd(files) {
