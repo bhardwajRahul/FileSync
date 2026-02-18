@@ -35,6 +35,13 @@ async function onLoad() {
   // Load version badge
   await loadVersion();
 
+  // Check WebRTC browser compatibility
+  if (typeof RTCPeerConnection === 'undefined') {
+    dom.error_div.style.display = 'block'
+    dom.error_message.innerHTML = 'Your browser does not support <a href="https://caniuse.com/?search=webrtc" target="_blank" style="color: inherit; text-decoration: underline;">WebRTC</a>.<br><span style="color: #6c757d; font-size: 14px; margin-top: 10px; display: inline-block;">Please use a modern browser such as Chrome or Firefox.</span>'
+    return
+  }
+
   // Create current user
   user = new User(room_id)
 

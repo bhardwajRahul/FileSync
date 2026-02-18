@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 # Init FastAPI
-app = FastAPI(title='FileSync API', version='3.6.0', root_path="/api")
+app = FastAPI(title='FileSync API', version='3.7.0', root_path="/api")
 
 # Allow your dev frontend origin
 app.add_middleware(
