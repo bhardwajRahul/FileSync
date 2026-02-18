@@ -23,8 +23,18 @@ if (window.localStorage.getItem('mode') == 'light') {
   qr.set({foreground: '#212529'});
 }
 
+// Load app version from API
+async function loadVersion() {
+  const res = await fetch('/api/');
+  const data = await res.json();
+  document.getElementById('appVersion').textContent = `v${data.version}`;
+}
+
 // On Load
 async function onLoad() {
+  // Load version badge
+  await loadVersion();
+
   // Create current user
   user = new User(room_id)
 
