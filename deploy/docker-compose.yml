@@ -1,19 +1,12 @@
 services:
   filesync:
-    image: poliuscorp/filesync
+    build: ..
+    # image: poliuscorp/filesync
     container_name: filesync-app
     environment:
       - SECRET_KEY=<SECRET_KEY>
     ports:
       - "80:80"
-    depends_on:
-      - peerjs
-    restart: unless-stopped
-
-  peerjs:
-    image: peerjs/peerjs-server:1.1.0-rc.2
-    container_name: filesync-peerjs
-    command: peerjs --path /peerjs
     depends_on:
       - coturn
     restart: unless-stopped
@@ -25,9 +18,14 @@ services:
       - --fingerprint
       - --use-auth-secret
       - --no-multicast-peers
+      - --no-cli
       - --realm=filesync.app
       - --static-auth-secret=<SECRET_KEY>
+      - --listening-port=3478
+      - --min-port=50000
+      - --max-port=50100
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
+      - "50000-50100:50000-50100/udp"
     restart: unless-stopped
