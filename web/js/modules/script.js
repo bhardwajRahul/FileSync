@@ -1,5 +1,7 @@
 import { dom } from './dom.js';
 import { User } from './webrtc/user.js';
+import { registerServiceWorker, installSinkBadge, sinkState, activeMode } from './sink.js';
+import { installIceModeBadge } from './webrtc/mode.js';
 
 // Room ID
 const room_id = window.location.pathname.substring(1)
@@ -42,6 +44,20 @@ async function onLoad() {
     return
   }
 
+  // Register the Service Worker (no-op in insecure contexts).
+  await registerServiceWorker();
+
+  // Show the dev sink badge if a ?sink= override is active.
+  installSinkBadge();
+
+  // Show the dev ICE badge if a ?ice= override is active. Stacks above the sink
+  // badge when both are present.
+  installIceModeBadge();
+
+  // Surface a one-time warning if the only sink available is the in-memory Blob fallback
+  // (insecure HTTP context, non-localhost). Large files will OOM in this configuration.
+  maybeShowInsecureContextWarning();
+
   // Create current user
   user = new User(room_id)
 
@@ -58,8 +74,19 @@ async function onLoad() {
     dom.transfer_add_password.style.display = 'block';
     qr.set({value: dom.transfer_url_value.innerHTML});
 
-    // Init peer connection
-    await user.init(new_room_id)
+    // Init peer connection. user.init throws on ICE-credential failure or any pre-
+    // 'open' Peer error — surface that here so the host UI doesn't sit silently on
+    // top of a half-initialized user._peer.
+    try {
+      await user.init(new_room_id)
+    } catch (err) {
+      console.warn('Host init failed:', err);
+      dom.transfer_div.style.display = 'none'
+      dom.connect_div.style.display = 'none'
+      dom.error_div.style.display = 'block'
+      dom.error_message.innerHTML = 'Could not start FileSync. Please check your connection and refresh the page.'
+      return
+    }
   }
   // Peer
   else {
@@ -68,11 +95,28 @@ async function onLoad() {
     dom.transfer_url_value.innerHTML = `${window.location.origin}/${room_id}`
     qr.set({value: dom.transfer_url_value.innerHTML});
 
-    // Init peer connection
-    await user.init()
+    // Init peer connection. See host-path comment above — same contract.
+    try {
+      await user.init()
+    } catch (err) {
+      console.warn('Peer init failed:', err);
+      dom.connect_div.style.display = 'none'
+      dom.error_div.style.display = 'block'
+      dom.error_message.innerHTML = 'Could not start FileSync. Please check your connection and refresh the page.'
+      return
+    }
 
-    // Connect to the room
-    await user.connect(room_id)
+    // Connect to the room. user.connect rejects if the host is unreachable
+    // (peer-unavailable, ICE failure, closed before open) — surface that as a
+    // user-facing error instead of leaving the spinner up indefinitely.
+    try {
+      await user.connect(room_id)
+    } catch (err) {
+      console.warn('Failed to join room:', err);
+      dom.connect_div.style.display = 'none'
+      dom.error_div.style.display = 'block'
+      dom.error_message.innerHTML = 'Could not reach the host. The room may no longer be active.'
+    }
   }
 }
 
@@ -157,7 +201,14 @@ function connectWithPassword() {
     dom.password_error.style.display = 'none'
     dom.password_submit.setAttribute("disabled", "")
     dom.password_loading.style.display = 'inline-block'
-    user.connect(room_id)
+    user.connect(room_id).catch((err) => {
+      // Connection couldn't even be opened (host gone, ICE failure). Re-enable the
+      // submit button so the user can retry or change room.
+      console.warn('Password retry failed to connect:', err);
+      dom.password_submit.removeAttribute("disabled")
+      dom.password_loading.style.display = 'none'
+      dom.password_error.style.display = 'block'
+    })
   }
 }
 window.connectWithPassword = connectWithPassword;
@@ -329,6 +380,34 @@ function generateRoomID() {
     room_id += alphabet[random[i] % alphabet.length];
   }
   return `${room_id.slice(0, 3)}-${room_id.slice(3, 7)}-${room_id.slice(7, 10)}`;
+}
+
+function maybeShowInsecureContextWarning() {
+  // Only warn when the auto path will land on Blob — i.e., not secure, not localhost.
+  // Forced overrides skip the warning (developer knows what they're doing).
+  if (sinkState.forced) return;
+  if (activeMode() !== 'blob') return;
+  if (window.isSecureContext) return;
+
+  const banner = document.createElement('div');
+  banner.id = 'insecure-context-banner';
+  banner.innerHTML = `
+    <strong>Heads-up:</strong> FileSync is running over plain HTTP, so large transfers may fail.
+    For files over 500&nbsp;MB, please deploy FileSync with HTTPS — see the
+    <a href="https://github.com/polius/filesync#option-2-https-production-with-custom-domain" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline;">HTTPS setup guide</a>.
+    <span id="insecure-context-banner-close" style="margin-left:10px; cursor:pointer; font-weight:bold;">×</span>
+  `;
+  Object.assign(banner.style, {
+    position: 'fixed', top: '0', left: '0', right: '0',
+    padding: '10px 16px',
+    backgroundColor: 'rgba(255, 193, 7, 0.95)',
+    color: '#212529',
+    fontSize: '14px', textAlign: 'center',
+    zIndex: '9999',
+    boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+  });
+  document.body.appendChild(banner);
+  document.getElementById('insecure-context-banner-close').onclick = () => banner.remove();
 }
 
 // On document loaded, execute onLoad() method.
