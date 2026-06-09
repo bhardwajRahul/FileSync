@@ -47,9 +47,6 @@ async function onLoad() {
   // Register the Service Worker (no-op in insecure contexts).
   await registerServiceWorker();
 
-  // Show which method received files will be saved with (resolved after SW registration).
-  updateSaveMethodIndicator();
-
   // Show the dev sink badge if a ?sink= override is active.
   installSinkBadge();
 
@@ -383,34 +380,6 @@ function generateRoomID() {
     room_id += alphabet[random[i] % alphabet.length];
   }
   return `${room_id.slice(0, 3)}-${room_id.slice(3, 7)}-${room_id.slice(7, 10)}`;
-}
-
-// Reflect the active save method (FS Access / Service Worker / Blob) in the Files card so
-// users can see how received files are written — and that large files are safe on the
-// streaming paths but risky on the in-memory fallback.
-function updateSaveMethodIndicator() {
-  const el = document.getElementById('transfer-save-method');
-  const label = document.getElementById('transfer-save-method-label');
-  const name = document.getElementById('transfer-save-method-name');
-  const iconGood = document.getElementById('transfer-save-method-icon-good');
-  const iconWarn = document.getElementById('transfer-save-method-icon-warn');
-  if (!el || !label) return;
-
-  const meta = {
-    fs:   { warn: false, method: 'File System Access', text: 'Saving received files directly to disk',    title: 'File System Access API — received files stream straight to a location you choose; nothing is held in memory.' },
-    sw:   { warn: false, method: 'Service Worker',     text: 'Streaming received files to your downloads', title: 'Service Worker streaming — received files stream into your browser downloads, memory-safe for files of any size.' },
-    blob: { warn: true,  method: 'Blob',               text: 'Buffering received files in memory',         title: 'Blob fallback — received files are held in memory before saving, so files over ~500 MB may fail. Serve FileSync over HTTPS to stream large files to disk.' },
-  }[activeMode()];
-  if (!meta) return;
-
-  label.textContent = meta.text;
-  if (name) name.textContent = meta.method;
-  el.title = meta.title;
-  el.classList.toggle('is-warn', meta.warn);
-  el.classList.toggle('is-good', !meta.warn);
-  if (iconGood) iconGood.style.display = meta.warn ? 'none' : 'inline';
-  if (iconWarn) iconWarn.style.display = meta.warn ? 'inline' : 'none';
-  el.style.display = 'flex';
 }
 
 function maybeShowInsecureContextWarning() {
