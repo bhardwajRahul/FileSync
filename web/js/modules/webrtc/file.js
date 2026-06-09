@@ -1,5 +1,25 @@
 import { dom } from '../dom.js';
 import { turn } from './turn.js';
+import { applyIceMode } from './mode.js';
+import { Peer } from './peer.js';
+import { openSink, sinkState } from '../sink.js';
+
+const CHUNK_SIZE = 16 * 1024;          // 16 KiB — under SCTP message-size limits on every browser.
+const HIGH_WATER = 1 << 20;            // 1 MiB — pause reads when DataChannel buffer is this full.
+const LOW_WATER  = 1 << 18;            // 256 KiB — resume when it drains to this level.
+const PROGRESS_REPORT_INTERVAL = 256 * 1024;  // Send a progress update every 256 KiB received.
+
+// Null-safe DOM helpers. WebRTC event handlers fire asynchronously and can outlive the
+// UI elements they reference (e.g., if the file row is being torn down concurrently).
+// Throwing inside an event handler poisons the rest of the transfer state machine.
+const $set = (id, prop, value) => {
+  const el = document.getElementById(id);
+  if (el) el[prop] = value;
+};
+const $style = (id, prop, value) => {
+  const el = document.getElementById(id);
+  if (el) el.style[prop] = value;
+};
 
 export class File {
   // File
@@ -15,14 +35,16 @@ export class File {
 
   // Receive
   _peer;
-  _chunks = [];
   _transferred = 0;
   _zip = false;
+  _zipController = null;
+  _sink = null;
   _in_progress = false;
   _aborted = false;
   _removed = false;
   _peerReconnectAttempts = 0;
   _peerReconnectTimer = null;
+  _lastProgressReportAt = 0;
 
   constructor(file) {
     this._id = file.id
@@ -37,33 +59,13 @@ export class File {
     return {"id": this._id, "name": this._name, "size": this._size, "owner_id": this._owner_id, "owner_name": this._owner_name}
   }
 
-  get id() {
-    return this._id;
-  }
-
-  get name() {
-    return this._name
-  }
-
-  get size() {
-    return this._size
-  }
-
-  get owner_id() {
-    return this._owner_id
-  }
-
-  get owner_name() {
-    return this._owner_name
-  }
-
-  get peer() {
-    return this._peer
-  }
-
-  get remotePeers() {
-    return this._remotePeers
-  }
+  get id() { return this._id; }
+  get name() { return this._name }
+  get size() { return this._size }
+  get owner_id() { return this._owner_id }
+  get owner_name() { return this._owner_name }
+  get peer() { return this._peer }
+  get remotePeers() { return this._remotePeers }
 
   get details() {
     return Object.values(this._remotePeers).reduce((acc, p) => {
@@ -76,122 +78,113 @@ export class File {
     }, {});
   }
 
-  get in_progress() {
-    return this._in_progress
-  }
+  get in_progress() { return this._in_progress }
+  set in_progress(value) { this._in_progress = value }
+  get aborted() { return this._aborted }
+  get removed() { return this._removed }
+  set removed(value) { return this._removed = value }
+  get transferred() { return this._transferred }
 
-  set in_progress(value) {
-    this._in_progress = value
-  }
-
-  get aborted() {
-    return this._aborted
-  }
-
-  get removed() {
-    return this._removed
-  }
-
-  set removed(value) {
-    return this._removed = value
-  }
-
-  get transferred() {
-    return this._transferred
-  }
-
-  get chunks() {
-    return this._chunks
-  }
-
-  set chunks(value) {
-    this._chunks = value
-  }
-
-  set owner_name(value) {
-    this._owner_name = value
-  }
-
-  set zip(value) {
-    this._zip = value
-  }
+  set owner_name(value) { this._owner_name = value }
+  set zip(value) { this._zip = value }
+  setZipController(c) { this._zipController = c }
 
   async init(peer_id) {
-    // Get ICE servers
+    // Get ICE servers. Caller is responsible for surfacing this — file.init is used
+    // for per-file Peers, so a failure here is a per-file failure, not a
+    // page-level fatal. Throwing lets downloadFile / downloadAll roll back their own
+    // UI state instead of having init reach into the global error div.
     let iceServers;
     try {
       iceServers = await turn.getServers();
     } catch (err) {
-      console.log(err)
-      dom.transfer_div.style.display = 'none'
-      dom.connect_div.style.display = 'none'
-      dom.error_div.style.display = 'block'
-      dom.error_message.innerHTML = 'An error occurred getting the ICE servers. Please try again later.'
-      return
+      console.warn('file.init: failed to get ICE servers:', err);
+      throw err;
     }
 
-    await new Promise(async (resolve) => {
-      // Get UUID
-      const uuid = await this._getUUID();
+    // UUID fetch is a normal await — its rejection propagates out of init naturally.
+    const uuid = await this._getUUID();
 
+    await new Promise((resolve, reject) => {
       // Create a new Peer instance
       const isSecure = window.location.protocol === 'https:';
       const peer = new Peer(uuid, {
         host: window.location.hostname,
         port: parseInt(window.location.port) || (isSecure ? 443 : 80),
-        path: "/peerjs",
         secure: isSecure,
-        config: {
-          iceServers: iceServers,
-          // iceTransportPolicy: "relay",  // Force TURN
-        }
+        config: applyIceMode({ iceServers }),
       });
 
-      // Emitted when a connection to the PeerServer is established.
+      if (peer_id === undefined) this._peer = peer
+      else this._remotePeers[peer_id].peer = peer
+
+      // Settle init exactly once. Without a reject path, a per-file Peer that can't
+      // reach the signaling server (server down, network blip, registration code
+      // 4400/4409) would hang init forever — and on the sender side, that would
+      // leak an outbound concurrency slot.
+      let settled = false;
+      const settle = (cb, arg) => { if (settled) return; settled = true; cb(arg); };
+
       peer.on('open', (id) => {
+        // Reset reconnect bookkeeping on every successful (re-)registration. Re-firing
+        // on reconnect is intentional (peer.js emits 'open' after each /ws register);
+        // only the first open settles the init promise.
         this._peerReconnectAttempts = 0;
         if (this._peerReconnectTimer) {
           clearTimeout(this._peerReconnectTimer);
           this._peerReconnectTimer = null;
         }
-        this._handleOpen(id, resolve);
+        if (!settled) this._handleOpen(id, () => settle(resolve));
       });
 
-      // Emitted when a new data connection is established from a remote peer.
+      peer.on('error', (err) => {
+        // Pre-'open' errors fail the init (caller bails). Post-'open' errors go to
+        // the normal handler so reconnect/warn paths keep working.
+        if (settled) {
+          this._handleError(err);
+        } else {
+          // Destroy the half-initialized Peer so its signaling WebSocket isn't left
+          // dangling — the caller will null its own reference to file._peer.
+          try { peer.destroy(); } catch {}
+          settle(reject, err);
+        }
+      });
+
       peer.on('connection', (conn) => conn.on('open', () => this._handleConnection(conn)));
-
-      // Emitted when the peer is disconnected from the signaling server.
       peer.on('disconnected', () => this._handlePeerDisconnected(peer));
-
-      // Errors on the peer are almost always fatal and will destroy the peer.
-      peer.on('error', (err) => this._handleError(err));
-
-      // Store peer (Receiver)
-      if (peer_id === undefined) this._peer = peer
-      // Store peer (Sender)
-      else this._remotePeers[peer_id].peer = peer
     })
   }
 
   async connect(peer_id) {
-    // Init new peer
     await this.init(peer_id)
 
-    // Establish a connection with the target peer.
-    await new Promise((resolve) => {
-      const conn = this._remotePeers[peer_id].peer.connect(peer_id);
+    await new Promise((resolve, reject) => {
+      // 'raw' serialization tells the peer client to pass strings and ArrayBuffers through
+      // the data channel verbatim — no BinaryPack, no auto-chunking. We frame
+      // ourselves: JSON strings for control messages, raw ArrayBuffers for bytes.
+      const conn = this._remotePeers[peer_id].peer.connect(peer_id, {
+        serialization: 'raw',
+        reliable: true,
+      });
 
-      // Emitted when the connection is established and ready-to-use.
-      conn.on('open', () => this._handleConnection(conn, resolve));
+      // Settle exactly once. Listening for error/close in addition to open guarantees
+      // we never hang here when the receiver is unreachable (peer-unavailable, ICE
+      // failure) — the slot in user._outboundActive depends on this promise settling.
+      let settled = false;
+      const settle = (cb, arg) => { if (settled) return; settled = true; cb(arg); };
+
+      conn.on('open', () => this._handleConnection(conn, () => settle(resolve)));
+      conn.on('error', (err) => settle(reject, err));
+      conn.on('close', () => settle(reject, new Error('Connection closed before open.')));
     })
   }
 
   async transfer(data) {
     // Update UI
-    document.getElementById(`file-${this._id}-error`).style.display = 'none'
-    document.getElementById(`file-${this._id}-icon-success`).style.display = 'none'
-    document.getElementById(`file-${this._id}-icon-loading`).style.display = 'block'
-    document.getElementById(`file-${this._id}-progress`).innerHTML = '0% | '
+    $style(`file-${this._id}-error`, 'display', 'none');
+    $style(`file-${this._id}-icon-success`, 'display', 'none');
+    $style(`file-${this._id}-icon-loading`, 'display', 'block');
+    $set(`file-${this._id}-progress`, 'textContent', '0% | ');
 
     // Store peer data
     this._remotePeers[data.peer_id] = {"user_id": data.requester_id, "user_name": data.requester_name, "peer": null, "conn": null, "online": true, "interval": null, "progress": 0, "aborted": false}
@@ -201,35 +194,79 @@ export class File {
 
     // Get connection
     const conn = this._remotePeers[data.peer_id].conn
+    const dc = conn.dataChannel;
+    if (!dc) {
+      console.error('No raw RTCDataChannel exposed for this connection.');
+      return;
+    }
+    dc.bufferedAmountLowThreshold = LOW_WATER;
 
     // Init interval to check connection status
     this._remotePeers[data.peer_id].interval = setInterval(() => this._isAlive(conn.peer), 500)
 
-    // Define vars for chunk processing
-    const chunkSize = 1024 * 1024 // 1 MB
-    let offset = 0
-    let position = 0
-
-    // Recursive function to process each chunk
-    const processChunk = async () => {
-      // Get the current chunk based on the offset and chunk size
-      const chunk = this._content.slice(offset, offset + chunkSize)
-      const isLastChunk = offset + chunkSize >= this._size
-
-      // Check if the connection to the remote peer is open
-      if (conn.peerConnection != null && conn.peerConnection.iceConnectionState != 'disconnected') {
-        conn.send({"webrtc-file-transfer": {"file": chunk, "transferred": chunk.size, "position": position}})
-      }
-
-      // If it's not the last chunk, process the next one
-      if (data.peer_id in this._remotePeers && !isLastChunk) {
-        offset += chunkSize
-        position += 1
-        await processChunk()
-      }
+    // Send header
+    try {
+      dc.send(JSON.stringify({
+        type: 'header',
+        name: this._name,
+        size: this._size,
+        mime: this._content && this._content.type ? this._content.type : 'application/octet-stream',
+      }));
+    } catch (err) {
+      console.error('Failed to send transfer header:', err);
+      return;
     }
-    // Start processing the chunks
-    processChunk()
+
+    // Stream the file in CHUNK_SIZE pieces. Each Blob.slice().arrayBuffer() reads only
+    // that slice from the OS-backed file — peak sender memory stays at one chunk.
+    let offset = 0;
+    while (offset < this._size) {
+      // Aborted by either side, or peer disconnected
+      if (!(data.peer_id in this._remotePeers)) return;
+      if (this._remotePeers[data.peer_id].aborted) return;
+      if (dc.readyState !== 'open') return;
+
+      const end = Math.min(offset + CHUNK_SIZE, this._size);
+      let buf;
+      try {
+        buf = await this._content.slice(offset, end).arrayBuffer();
+      } catch (err) {
+        console.error('Failed to read file slice:', err);
+        return;
+      }
+
+      await this._awaitDrain(dc);
+      try {
+        dc.send(buf);
+      } catch (err) {
+        console.error('DataChannel send failed:', err);
+        return;
+      }
+      offset = end;
+    }
+
+    // Send end marker (best-effort; channel may have closed)
+    try {
+      await this._awaitDrain(dc);
+      dc.send(JSON.stringify({ type: 'end' }));
+    } catch {}
+  }
+
+  // Wait for dataChannel to drain below the high-water mark. Re-checks after
+  // subscribing to avoid a race where the event fires before we subscribe.
+  _awaitDrain(dc) {
+    if (dc.bufferedAmount < HIGH_WATER) return Promise.resolve();
+    return new Promise((resolve) => {
+      const handler = () => {
+        dc.removeEventListener('bufferedamountlow', handler);
+        resolve();
+      };
+      dc.addEventListener('bufferedamountlow', handler);
+      if (dc.bufferedAmount < HIGH_WATER) {
+        dc.removeEventListener('bufferedamountlow', handler);
+        resolve();
+      }
+    });
   }
 
   abort() {
@@ -241,165 +278,225 @@ export class File {
     this._removed = true
   }
 
-  // Emitted when a connection to the PeerServer is established. 
   _handleOpen(id, resolve) {
     resolve()
   }
 
-  // Handles disconnection from the PeerJS signaling server for file transfer peers.
   _handlePeerDisconnected(peer) {
-    // Guard: skip if a reconnect timer is already pending
     if (this._peerReconnectTimer) return;
-
     const maxAttempts = 3;
     if (this._peerReconnectAttempts >= maxAttempts) {
       console.error(`File peer: failed to reconnect after ${maxAttempts} attempts.`);
       return;
     }
-
     const delay = 1000 * Math.pow(2, this._peerReconnectAttempts);
     this._peerReconnectAttempts++;
     console.warn(`File peer disconnected. Reconnecting in ${delay}ms (attempt ${this._peerReconnectAttempts}/${maxAttempts})...`);
-
     this._peerReconnectTimer = setTimeout(() => {
       this._peerReconnectTimer = null;
       if (!peer.destroyed) peer.reconnect();
     }, delay);
   }
 
-  // Emitted when the connection is established and ready-to-use. 
   _handleConnection(conn, resolve) {
-    // console.log('Received file connection from', conn.peer)
-
-    // Emitted when data is received from the remote peer. 
     conn.on('data', (data) => this._handleData(conn, data));
-
-    // Emitted when either you or the remote peer closes the data connection.
     conn.on('close', () => this._handleClose(conn));
-
-    // Emitted when there is an unexpected error in the data connection.
     conn.on('error', (err) => this._handleError(err));
 
-    // Sender
+    // Sender side — _remotePeers entry already exists; store conn and resolve.
     if (resolve !== undefined) {
       this._remotePeers[conn.peer].conn = conn
       resolve()
     }
-    // Receiver
+    // Receiver side — incoming connection from the sender.
     else {
-      this._chunks = []
       this._transferred = 0
       this._aborted = false
+      this._lastProgressReportAt = 0
     }
   }
 
-  // Check if file connection is alive.
   async _isAlive(peer_id) {
-    if (this._remotePeers[peer_id].conn.peerConnection === null || this._remotePeers[peer_id].conn.peerConnection.iceConnectionState == 'disconnected') {
-      clearInterval(this._remotePeers[peer_id].interval);
-      if (this._remotePeers[peer_id].progress != 100) {
-        this._remotePeers[peer_id].aborted = true
-      }
-      this._onFileProgress()
-      this._remotePeers[peer_id].online = false
+    const peer = this._remotePeers[peer_id];
+    if (!peer) return;
+    const pc = peer.conn ? peer.conn.peerConnection : null;
+    const state = pc ? pc.iceConnectionState : null;
+    // Any terminal state ('disconnected', 'failed', 'closed') means the connection is
+    // gone; treat null pc the same way. Without covering 'closed'/'failed' we leak the
+    // interval when the connection is torn down via our explicit close paths.
+    if (pc === null || state === 'disconnected' || state === 'failed' || state === 'closed') {
+      clearInterval(peer.interval);
+      peer.interval = null;
+      if (peer.progress != 100) peer.aborted = true;
+      this._onFileProgress();
+      peer.online = false;
     }
   }
 
-  // Emitted when data is received from the remote peer.
   async _handleData(conn, data) {
-    if ("webrtc-file-transfer" in data) {
-      this._onFileTransfer(conn, data['webrtc-file-transfer'])
+    // String frames are JSON-encoded control messages.
+    if (typeof data === 'string') {
+      let msg;
+      try { msg = JSON.parse(data); } catch { return; }
+
+      switch (msg.type) {
+        // Sender-side handlers (receiver -> sender):
+        case 'progress':  return this._onFileProgress(conn, { progress: msg.percent });
+        case 'abort':     return this._onFileAborted(conn);
+
+        // Receiver-side handlers (sender -> receiver):
+        case 'header':    return this._onHeader(conn, msg);
+        case 'end':       return this._onEnd(conn);
+      }
+      return;
     }
-    else if ("webrtc-file-progress" in data) {
-      this._onFileProgress(conn, data['webrtc-file-progress'])
+
+    // Binary frames are file bytes (receiver only).
+    if (data instanceof ArrayBuffer) {
+      return this._onChunk(conn, data);
     }
-    else if ("webrtc-file-abort" in data) {
-      this._onFileAborted(conn)
+    if (ArrayBuffer.isView(data)) {
+      return this._onChunk(conn, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
     }
   }
 
-  async _onFileTransfer(conn, data) {
-    // If it's aborted, do nothing. 
+  async _onHeader(conn, header) {
     if (this._aborted) {
-      conn.send({"webrtc-file-abort": true})
-      conn.close()
-      this._peer.destroy()
-      this._in_progress = false
-      return
+      this._terminateReceive(conn, 'aborted');
+      return;
     }
 
-    // Store file chunk
-    this._chunks[data.position] = data.file
-    this._transferred += data.transferred
+    this._transferred = 0;
+    this._lastProgressReportAt = 0;
 
-    // Compute progress
-    this._progress = Math.floor(this._transferred / this._size * 100)
+    // Zip mode: bytes flow into the externally-supplied stream controller; no per-file sink.
+    if (this._zip) return;
 
-    // Update Progress UI
-    if (!this._zip) {
-      document.getElementById(`file-${this._id}-progress`).innerHTML = `${this._progress}% | `
+    // The sink is opened up-front by user.downloadFile() so the FS Access save picker
+    // (and the SW iframe trigger) can fire inside the user-gesture window. By the time
+    // the header arrives, the sink is already in place — use it as-is. Re-opening here
+    // would (a) show a second save picker on FS Access, (b) trigger a second browser
+    // download via a second iframe on SW, (c) leak the first chunks[] array on Blob.
+    if (this._sink) return;
+
+    // No pre-opened sink and not in zip mode — this shouldn't happen with current
+    // callers, but handle it defensively rather than silently dropping bytes.
+    console.error('Sink was not pre-opened before transfer header arrived.');
+    this._aborted = true;
+    this._terminateReceive(conn, 'no-sink');
+    const errEl = document.getElementById(`file-${this._id}-error`);
+    if (errEl) {
+      errEl.style.display = 'block';
+      errEl.textContent = 'Could not start the download.';
+    }
+    $style(`file-${this._id}-icon-loading`, 'display', 'none');
+    $style(`file-${this._id}-download`, 'display', 'block');
+    $style(`file-${this._id}-abort`, 'display', 'none');
+  }
+
+  // Single cleanup point for the receiver side of a transfer. Idempotent — safe to call
+  // from any abort/error path. Closes the connection, destroys the per-file Peer so its
+  // signaling-server socket isn't left dangling, and clears in-progress state.
+  _terminateReceive(conn, reason) {
+    try { conn.dataChannel.send(JSON.stringify({ type: 'abort', reason })); } catch {}
+    try { conn.close(); } catch {}
+    if (this._sink) {
+      this._sink.abort(reason).catch(() => {});
+      this._sink = null;
+    }
+    if (this._zip && this._zipController) {
+      try { this._zipController.error(new Error(reason)); } catch {}
+      this._zipController = null;
+    }
+    try { if (this._peer) this._peer.destroy(); } catch {}
+    this._in_progress = false;
+  }
+
+  async _onChunk(conn, buf) {
+    if (this._aborted) {
+      this._terminateReceive(conn, 'aborted');
+      return;
     }
 
-    // Notify progress
-    conn.send({"webrtc-file-progress": {"progress": this._progress}})
+    const bytes = new Uint8Array(buf);
+    this._transferred += bytes.byteLength;
 
-    // If it's the last chunk
-    if (this._transferred == this._size) {
-      if (!this._zip) {
-        // Update UI
-        document.getElementById(`file-${this._id}-download`).style.display = 'block'
-        document.getElementById(`file-${this._id}-abort`).style.display = 'none'
-        document.getElementById(`file-${this._id}-icon-loading`).style.display = 'none'
-        document.getElementById(`file-${this._id}-icon-success`).style.display = 'block'
-
-        // Create a new Blob from all file chunks
-        const blob = new Blob(this._chunks);
-
-        // Download file
-        const downloadLink = document.createElement('a')
-        downloadLink.href = URL.createObjectURL(blob)
-        downloadLink.download = this._name
-        downloadLink.click()
-
-        // Clean data
-        this._chunks = []
-        this._transferred = 0
+    // Route to the appropriate sink
+    try {
+      if (this._zip) {
+        if (this._zipController) this._zipController.enqueue(bytes);
+      } else if (this._sink) {
+        await this._sink.write(bytes);
       }
-
-      // Update internal parameters
-      this._in_progress = false
-
-      // Close connection
-      conn.close()
-
-      // Destroy current peer to free up resources
-      this._peer.destroy()
+    } catch (err) {
+      console.error('Sink write failed:', err);
+      this._aborted = true;
+      this._terminateReceive(conn, 'sink-write-failed');
+      return;
     }
+
+    // Progress UI (single-file mode)
+    const progress = this._size > 0 ? Math.floor(this._transferred / this._size * 100) : 0;
+    if (!this._zip) {
+      $set(`file-${this._id}-progress`, 'textContent', `${progress}% | `);
+    }
+
+    // Notify the sender of progress, throttled.
+    const shouldReport =
+      this._transferred === this._size ||
+      this._transferred - this._lastProgressReportAt >= PROGRESS_REPORT_INTERVAL;
+    if (shouldReport) {
+      this._lastProgressReportAt = this._transferred;
+      try { conn.dataChannel.send(JSON.stringify({ type: 'progress', percent: progress })); } catch {}
+    }
+  }
+
+  async _onEnd(conn) {
+    if (this._zip) {
+      if (this._zipController) {
+        try { this._zipController.close(); } catch {}
+        this._zipController = null;
+      }
+    } else if (this._sink) {
+      try { await this._sink.close(); }
+      catch (err) { console.error('Sink close failed:', err); }
+      this._sink = null;
+
+      // UI: success state
+      $set(`file-${this._id}-progress`, 'textContent', '');
+      $style(`file-${this._id}-download`, 'display', 'block');
+      $style(`file-${this._id}-abort`, 'display', 'none');
+      $style(`file-${this._id}-icon-loading`, 'display', 'none');
+      $style(`file-${this._id}-icon-success`, 'display', 'block');
+    }
+
+    this._in_progress = false;
+
+    try { conn.close(); } catch {}
+    try { this._peer.destroy(); } catch {}
   }
 
   _onFileProgress(conn, data) {
-    // Track data transfer progress
-    if (data) {
+    // Sender-side: track per-receiver progress so 'See details' is accurate.
+    if (data && conn) {
       this._remotePeers[conn.peer].progress = data.progress
     }
 
-    // Calculate overall progress
     const onlinePeers = Object.values(this._remotePeers).filter(x => x.online)
     const totalProgress = onlinePeers.reduce((sum, x) => sum + x.progress, 0)
     const overall_progress = onlinePeers.length == 0 ? 0 : Math.floor(totalProgress / onlinePeers.length)
 
-    // Update UI: Show the overall progress
-    document.getElementById(`file-${this._id}-progress`).innerHTML = `${overall_progress}% | `
+    $set(`file-${this._id}-progress`, 'textContent', `${overall_progress}% | `);
 
     if (overall_progress == 100) {
-      document.getElementById(`file-${this._id}-abort`).style.display = 'none'
-      document.getElementById(`file-${this._id}-icon-loading`).style.display = 'none'
-      document.getElementById(`file-${this._id}-icon-success`).style.display = 'block'
+      $style(`file-${this._id}-abort`, 'display', 'none');
+      $style(`file-${this._id}-icon-loading`, 'display', 'none');
+      $style(`file-${this._id}-icon-success`, 'display', 'block');
     }
     else if (!this._aborted && onlinePeers.filter(x => !x.aborted).length == 0) {
-      document.getElementById(`file-${this._id}-icon-loading`).style.display = 'none'
-      document.getElementById(`file-${this._id}-error`).style.display = 'block'
-      document.getElementById(`file-${this._id}-error`).innerHTML = 'All users stopped the file transfer.'
+      $style(`file-${this._id}-icon-loading`, 'display', 'none');
+      $style(`file-${this._id}-error`, 'display', 'block');
+      $set(`file-${this._id}-error`, 'textContent', 'All users stopped the file transfer.');
     }
   }
 
@@ -408,17 +505,28 @@ export class File {
     this._onFileProgress()
   }
 
-  // Emitted when either you or the remote peer closes the data connection.
   _handleClose(conn) {
-    // Sender
+    // Sender side: this._remotePeers holds the per-receiver Peer; destroy that one.
     if (conn.peer in this._remotePeers) {
-      this._remotePeers[conn.peer].peer.destroy()
+      try { this._remotePeers[conn.peer].peer.destroy() } catch {}
+      return;
+    }
+    // Receiver side: if the channel closed before we got 'end', do a full cleanup —
+    // abort the sink so we don't leave a half-written file, and destroy the per-file
+    // Peer so its signaling socket isn't left dangling.
+    if (this._transferred < this._size && this._in_progress) {
+      this._terminateReceive(conn, 'connection-closed');
+    } else if (this._zip && this._zipController) {
+      // Connection closed cleanly but in zip mode the controller is still pending —
+      // happens if the sender closed without sending an explicit 'end'. Treat as abort.
+      try { this._zipController.error(new Error('connection-closed')); } catch {}
+      this._zipController = null;
+      try { if (this._peer) this._peer.destroy(); } catch {}
+      this._in_progress = false;
     }
   }
 
-  // Emitted when there is an unexpected error in the data connection.
   _handleError(err) {
-    // Recoverable signaling errors — handled by 'disconnected' event
     if (['disconnected', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
       console.warn(`File peer recoverable error (${err.type}).`);
       return;
