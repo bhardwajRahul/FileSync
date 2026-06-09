@@ -254,18 +254,23 @@ export class File {
     } catch {}
   }
 
-  // Wait for dataChannel to drain below the high-water mark. Re-checks after
-  // subscribing to avoid a race where the event fires before we subscribe.
+  // Wait for the dataChannel to drain below the high-water mark. Resolves on
+  // 'bufferedamountlow', or on close/error so a receiver dropping mid-transfer with a
+  // full buffer can't hang the send loop forever. Re-checks after subscribing.
   _awaitDrain(dc) {
     if (dc.bufferedAmount < HIGH_WATER) return Promise.resolve();
     return new Promise((resolve) => {
-      const handler = () => {
-        dc.removeEventListener('bufferedamountlow', handler);
-        resolve();
+      const cleanup = () => {
+        dc.removeEventListener('bufferedamountlow', onResolve);
+        dc.removeEventListener('close', onResolve);
+        dc.removeEventListener('error', onResolve);
       };
-      dc.addEventListener('bufferedamountlow', handler);
-      if (dc.bufferedAmount < HIGH_WATER) {
-        dc.removeEventListener('bufferedamountlow', handler);
+      const onResolve = () => { cleanup(); resolve(); };
+      dc.addEventListener('bufferedamountlow', onResolve);
+      dc.addEventListener('close', onResolve);
+      dc.addEventListener('error', onResolve);
+      if (dc.bufferedAmount < HIGH_WATER || dc.readyState !== 'open') {
+        cleanup();
         resolve();
       }
     });
