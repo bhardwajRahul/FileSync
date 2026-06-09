@@ -42,6 +42,7 @@
   --color-button-border: #cdcfd1;
   --color-border: #cdcfd1;
   --color-muted: #6c757d;
+  --color-warn: #9a6207;
   --color-card-header-bg: #f9fafb;
   --shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.05);
   --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.07), 0 2px 4px -2px rgba(0,0,0,0.05);
@@ -66,6 +67,7 @@
   --color-button-border: #464f59;
   --color-border: #464f59;
   --color-muted: #6c757d;
+  --color-warn: #e3a008;
   --color-card-header-bg: #292e33;
   --shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.3);
   --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.4), 0 2px 4px -2px rgba(0,0,0,0.3);
@@ -295,6 +297,34 @@ textarea::-webkit-scrollbar-thumb {
 
 .card .list-group-item:hover {
   background-color: var(--color-card-header-bg) !important;
+}
+
+/* Save-method strip: shows how received files are written to disk (FS / SW / Blob). */
+.save-method {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 9px 18px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--color-muted);
+  background-color: var(--color-card-header-bg);
+  border-bottom: 1px solid var(--color-border);
+}
+.save-method svg { flex-shrink: 0; }
+.save-method.is-good svg { color: var(--color-icon); }
+.save-method.is-warn { color: var(--color-warn); }
+.save-method.is-warn svg { color: var(--color-warn); }
+.save-method-name {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  color: inherit;
+  opacity: 0.8;
 }
 
 /* --- Buttons --- */
