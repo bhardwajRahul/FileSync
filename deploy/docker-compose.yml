@@ -1,7 +1,7 @@
 services:
   filesync:
-    build: ..
-    # image: poliuscorp/filesync
+    # build: ..
+    image: poliuscorp/filesync
     container_name: filesync-app
     environment:
       - SECRET_KEY=<SECRET_KEY>
