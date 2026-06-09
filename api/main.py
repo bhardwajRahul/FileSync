@@ -1,19 +1,21 @@
 import os
+import time
 import hmac
 import hashlib
 import base64
-import time
-import jwt
 import uuid
+import jwt
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from api.signaling import router as signaling_router
 
 # Get environment variables
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 # Init FastAPI
-app = FastAPI(title='FileSync API', version='3.7.0', root_path="/api")
+app = FastAPI(title='FileSync API', version='3.8.0', root_path="/api")
 
 # Allow your dev frontend origin
 app.add_middleware(
@@ -62,3 +64,6 @@ def generate_turn_credentials(ttl):
     dig = hmac.new(SECRET_KEY.encode(), username.encode(), hashlib.sha1).digest()
     password = base64.b64encode(dig).decode()
     return username, password
+
+# Mount WebRTC signaling routes (/ws). Implementation lives in api/signaling.py.
+app.include_router(signaling_router)
