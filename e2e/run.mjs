@@ -252,8 +252,17 @@ async function installFsSinkShim(ctx) {
       kind: 'file',
       name: 'shim.bin',
       async createWritable() {
+        // Emulate FileSystemWritableFileStream's lock: a real writable throws if write()
+        // is called while a previous write() is still pending. This catches the app
+        // issuing overlapping (unserialized) writes.
+        let busy = false;
+        let closed = false;
         return {
           async write(input) {
+            if (closed) throw new DOMException('Stream is closed', 'InvalidStateError');
+            if (busy) throw new DOMException('write() called during a pending write()', 'InvalidStateError');
+            busy = true;
+            try {
             // The real API accepts ArrayBuffer/TypedArray/Blob, or
             // { type: 'write', data, position?, size? }. The app currently calls
             // write(Uint8Array) directly, but handle the others defensively.
@@ -273,9 +282,12 @@ async function installFsSinkShim(ctx) {
               throw new Error('FS shim: unsupported write input: ' + Object.prototype.toString.call(data));
             }
             await window.__fsChunk(bytes);
+            } finally {
+              busy = false;
+            }
           },
-          async close() { await window.__fsDone(); },
-          async abort() { try { await window.__fsDone(); } catch {} },
+          async close() { closed = true; await window.__fsDone(); },
+          async abort() { closed = true; try { await window.__fsDone(); } catch {} },
           async seek()      { /* no-op */ },
           async truncate()  { /* no-op */ },
         };
