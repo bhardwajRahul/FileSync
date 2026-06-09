@@ -128,12 +128,12 @@ To expose FileSync to the internet, ensure the following ports are open on your 
 
 ### HTTP Setup
 - **Port 80** (TCP) - Web interface
-- **Port 3478** (TCP + UDP) - STUN/TURN signaling
+- **Port 3478** (TCP + UDP) - STUN/TURN server (NAT traversal)
 - **Ports 50000–50100** (UDP) - TURN relay range
 
 ### HTTPS Setup
 - **Port 443** (TCP) - Web interface (HTTPS)
-- **Port 3478** (TCP + UDP) - STUN/TURN signaling
+- **Port 3478** (TCP + UDP) - STUN/TURN server (NAT traversal)
 - **Ports 50000–50100** (UDP) - TURN relay range
 
 > **Note:** Port 3478 is required for peer-to-peer connection setup. The 50000–50100 UDP range carries TURN-relayed traffic when peers cannot connect directly — typically ~5–10% of connections, most often when a peer is behind symmetric NAT or a UDP-blocking firewall.
@@ -180,6 +180,14 @@ FileSync uses native [WebRTC](https://developer.mozilla.org/en-US/docs/Web/API/W
 
 A lightweight WebSocket signaling server (served at `/ws` by the FileSync app itself) assists with the initial connection setup — relaying SDP offers/answers and ICE candidates between peers. Once a P2P connection is established, the signaling server steps back and file bytes flow directly between browsers. The server never has access to file contents.
 
-Whenever the page is served over HTTPS, FileSync streams received data directly to disk using the [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_Access_API) (on Chromium browsers) or a Service Worker — so memory usage stays bounded regardless of file size. Over plain HTTP, neither streaming sink is available; the whole file is buffered in browser memory, which might become unreliable past ~500 MB.
+### How received files are saved
+
+Received files are written to disk as the bytes arrive, so even multi-gigabyte transfers use almost no memory. FileSync automatically picks the best method your browser supports:
+
+1. **Straight to disk** — desktop Chrome, Edge, Brave, or Opera over HTTPS. You choose where to save and the file streams directly there. Limited only by free disk space.
+2. **Streaming download** — Firefox, Safari, and mobile browsers over HTTPS. The file streams into a normal browser download without being held in memory.
+3. **In-memory download** — the universal fallback, and the only option over plain HTTP. The file is buffered in the browser until the transfer completes, so very large files (roughly 500 MB+) may be unreliable.
+
+> Methods 1 and 2 need a secure context (HTTPS, or `localhost` for development). **Running FileSync over HTTPS is strongly recommended** — it unlocks fast, memory-safe transfers of files of any size.
 
 ![File Transfer - https://xkcd.com/949](web/assets/comic.png)
