@@ -33,10 +33,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Set tag without first two chars
+      - name: Derive version tag from the git ref
         id: tag
         run: |
-          SHORT_TAG="${GITHUB_REF_NAME:2}"
+          # Strip a leading "v" and an optional "." so both v4.0.0 and v.4.0.0 -> 4.0.0.
+          SHORT_TAG="${GITHUB_REF_NAME#v}"
+          SHORT_TAG="${SHORT_TAG#.}"
           echo "SHORT_TAG=$SHORT_TAG" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image

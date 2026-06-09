@@ -16,7 +16,7 @@
 
 <br>
 
-![FileSync](web/assets/filesync.png?v=3.4.0)
+![FileSync](web/assets/filesync.png?v=4.0.0)
 
 </div>
 
