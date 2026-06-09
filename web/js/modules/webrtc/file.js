@@ -45,6 +45,8 @@ export class File {
   _peerReconnectAttempts = 0;
   _peerReconnectTimer = null;
   _lastProgressReportAt = 0;
+  // Serializes sink writes; FS Access writables lock on concurrent writes. Reset in _onHeader.
+  _writeChain = Promise.resolve();
 
   constructor(file) {
     this._id = file.id
@@ -368,6 +370,7 @@ export class File {
 
     this._transferred = 0;
     this._lastProgressReportAt = 0;
+    this._writeChain = Promise.resolve();
 
     // Zip mode: bytes flow into the externally-supplied stream controller; no per-file sink.
     if (this._zip) return;
@@ -421,12 +424,15 @@ export class File {
     const bytes = new Uint8Array(buf);
     this._transferred += bytes.byteLength;
 
-    // Route to the appropriate sink
+    // Route to the appropriate sink. Sink writes go through _writeChain so concurrent
+    // _onChunk calls can't issue overlapping writes (in arrival order).
     try {
       if (this._zip) {
         if (this._zipController) this._zipController.enqueue(bytes);
       } else if (this._sink) {
-        await this._sink.write(bytes);
+        const sink = this._sink;
+        this._writeChain = this._writeChain.then(() => sink.write(bytes));
+        await this._writeChain;
       }
     } catch (err) {
       console.error('Sink write failed:', err);
@@ -458,7 +464,8 @@ export class File {
         this._zipController = null;
       }
     } else if (this._sink) {
-      try { await this._sink.close(); }
+      // Drain queued writes before closing so no chunk is lost.
+      try { await this._writeChain; await this._sink.close(); }
       catch (err) { console.error('Sink close failed:', err); }
       this._sink = null;
 
