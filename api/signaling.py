@@ -3,9 +3,12 @@ import re
 import time
 import json
 import asyncio
+import logging
 import ipaddress
 from typing import Dict, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+
+logger = logging.getLogger("filesync.signaling")
 
 
 # =========================================================================================
@@ -369,14 +372,14 @@ async def signaling(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception:
         # Defensive: never let the handler crash silently.
         try:
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Server error.")
         except Exception:
             pass
-        # Log via standard error stream; uvicorn captures it.
-        print(f"signaling: unhandled error for peer {peer_id!r}: {type(e).__name__}: {e}")
+        # Log with traceback; uvicorn captures it.
+        logger.exception("signaling: unhandled error for peer %r", peer_id)
     finally:
         if peer_id is not None:
             await _REGISTRY.unregister(peer_id, websocket)

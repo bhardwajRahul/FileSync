@@ -11,20 +11,27 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.signaling import router as signaling_router
 
-# Get environment variables
+# Get environment variables. SECRET_KEY signs both the TURN HMAC credentials and the JWT,
+# so refuse to start without it rather than failing later at request time.
 SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required.")
 
 # Init FastAPI
-app = FastAPI(title='FileSync API', version='3.8.0', root_path="/api")
+app = FastAPI(title='FileSync API', version='4.0.0', root_path="/api")
 
-# Allow your dev frontend origin
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is only needed when the frontend is served from a different origin than the API
+# (i.e. local development). In production everything is same-origin behind the reverse
+# proxy, so this stays off unless CORS_ORIGINS is explicitly set (comma-separated).
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Add root route
 @app.get("/")
