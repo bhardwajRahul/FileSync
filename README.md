@@ -182,12 +182,12 @@ A lightweight WebSocket signaling server (served at `/ws` by the FileSync app it
 
 ### How received files are saved
 
-Received files are written to disk as the bytes arrive, so even multi-gigabyte transfers use almost no memory. FileSync automatically picks the best method your browser supports:
+FileSync writes received files to disk as the bytes arrive, so transfers use almost no memory regardless of size. It uses the first method the browser supports, falling back in order:
 
-1. **Straight to disk** — desktop Chrome, Edge, Brave, or Opera over HTTPS. You choose where to save and the file streams directly there. Limited only by free disk space.
-2. **Streaming download** — Firefox, Safari, and mobile browsers over HTTPS. The file streams into a normal browser download without being held in memory.
-3. **In-memory download** — the universal fallback, and the only option over plain HTTP. The file is buffered in the browser until the transfer completes, so very large files (roughly 500 MB+) may be unreliable.
+1. **File System Access API** — streams straight to a file you pick. Desktop Chromium browsers (Chrome, Edge, Brave, Opera) over HTTPS.
+2. **Service Worker** — streams into a normal browser download. All modern browsers over HTTPS.
+3. **Blob** — buffers the whole file in memory, then saves it. Last resort; the only option over plain HTTP, and unreliable past ~500 MB.
 
-> Methods 1 and 2 need a secure context (HTTPS, or `localhost` for development). **Running FileSync over HTTPS is strongly recommended** — it unlocks fast, memory-safe transfers of files of any size.
+The first two require a secure context (HTTPS, or `localhost`), so **serving FileSync over HTTPS is recommended** — it enables memory-safe transfers of any size.
 
 ![File Transfer - https://xkcd.com/949](web/assets/comic.png)
