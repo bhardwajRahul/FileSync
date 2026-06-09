@@ -168,10 +168,12 @@ export class User {
     if (peer === undefined) return;
     const pc = peer.conn ? peer.conn.peerConnection : null;
     const state = pc ? pc.iceConnectionState : null;
-    // Treat any terminal state as gone; covers the case where the conn is closed
-    // explicitly (state goes to 'closed', not 'disconnected') as well as transport
-    // failures ('failed') and the historic 'disconnected' case.
-    if (pc === null || state === 'disconnected' || state === 'failed' || state === 'closed') {
+    // 'failed'/'closed' (and a null pc) are terminal. 'disconnected' is often transient
+    // and can recover, so only treat it as gone after a short grace window — otherwise a
+    // brief blip would drop a peer that WebRTC would have reconnected on its own.
+    peer.disconnectedSince = state === 'disconnected' ? (peer.disconnectedSince || Date.now()) : null;
+    const gaveUp = peer.disconnectedSince && (Date.now() - peer.disconnectedSince) > 4000;
+    if (pc === null || state === 'failed' || state === 'closed' || gaveUp) {
       clearInterval(peer.interval);
       peer.interval = null;
       this._handleClose(peer.conn);
@@ -210,7 +212,7 @@ export class User {
 
     const delay = 1000 * Math.pow(2, this._reconnectAttempts);
     this._reconnectAttempts++;
-    console.log(`Reconnect attempt ${this._reconnectAttempts}/${maxAttempts} in ${delay}ms...`);
+    console.warn(`Reconnect attempt ${this._reconnectAttempts}/${maxAttempts} in ${delay}ms...`);
 
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
@@ -349,6 +351,9 @@ export class User {
   removeFile(fileId) {
     this._files[fileId]._aborted = true
     this._files[fileId]._removed = true
+    // Stop any in-flight outbound transfers immediately (the send loop checks both the
+    // file-level _aborted and the per-receiver aborted flag).
+    for (const p of Object.values(this._files[fileId]._remotePeers)) p.aborted = true
 
     // Notify all peers
     for (let peer of Object.values(this._remotePeers)) {
@@ -698,6 +703,16 @@ export class User {
       try { await zipSink.abort(String(err)); } catch {}
       this._downloadAll.active = false;
     } finally {
+      // Tear down the in-flight file's per-file peer/connection so a cancel doesn't leak
+      // its signaling socket — the zip orchestration above doesn't otherwise close it.
+      const inflight = this._downloadAll.file;
+      if (inflight) {
+        try { if (inflight._conn) inflight._conn.close(); } catch {}
+        try { if (inflight._peer) inflight._peer.destroy(); } catch {}
+        inflight._conn = null;
+        inflight._peer = null;
+        inflight._in_progress = false;
+      }
       for (const f of Object.values(this._files)) {
         f.zip = false;
         f.setZipController(null);
@@ -763,9 +778,7 @@ export class User {
 
   // Emitted when the connection is established and ready-to-use (a peer connects to the host).
   async _handleConnection(conn, resolve) {
-    // console.log('Received connection from', conn.peer)
-
-    // Emitted when data is received from the remote peer. 
+    // Emitted when data is received from the remote peer.
     conn.on('data', (data) => this._handleData(conn, data));
 
     // Emitted when either you or the remote peer closes the data connection.
@@ -794,8 +807,6 @@ export class User {
 
   // Emitted when data is received from the remote peer.
   async _handleData(conn, data) {
-    // console.log("Received data from", conn.peer, data)
-
     if ('webrtc-connect' in data && this._isHost) {
       if (this._password.length != 0 && !('password' in data['webrtc-connect'])) {
         conn.send({'webrtc-connect-response': {"status": "password_required"}})
@@ -1195,7 +1206,7 @@ export class User {
     document.getElementById(`file-${data.file_id}-icon-loading`).style.display = 'none'
     document.getElementById(`file-${data.file_id}-icon-failed`).style.display = 'none'
     document.getElementById(`file-${data.file_id}-error`).style.display = 'block' 
-    document.getElementById(`file-${data.file_id}-error`).innerHTML = 'This file has been remove it.'
+    document.getElementById(`file-${data.file_id}-error`).innerHTML = 'This file has been removed.'
 
     // Send file to all peers excluding the peer that has sent the file
     if (this._isHost) {

@@ -8,6 +8,7 @@ const CHUNK_SIZE = 16 * 1024;          // 16 KiB — under SCTP message-size lim
 const HIGH_WATER = 1 << 20;            // 1 MiB — pause reads when DataChannel buffer is this full.
 const LOW_WATER  = 1 << 18;            // 256 KiB — resume when it drains to this level.
 const PROGRESS_REPORT_INTERVAL = 256 * 1024;  // Send a progress update every 256 KiB received.
+const ICE_DISCONNECT_GRACE_MS = 4000;  // tolerate transient ICE 'disconnected' before giving up.
 
 // Null-safe DOM helpers. WebRTC event handlers fire asynchronously and can outlive the
 // UI elements they reference (e.g., if the file row is being torn down concurrently).
@@ -35,6 +36,7 @@ export class File {
 
   // Receive
   _peer;
+  _conn = null;            // receiver's active inbound connection, for eager teardown on abort
   _transferred = 0;
   _zip = false;
   _zipController = null;
@@ -223,7 +225,8 @@ export class File {
     // that slice from the OS-backed file — peak sender memory stays at one chunk.
     let offset = 0;
     while (offset < this._size) {
-      // Aborted by either side, or peer disconnected
+      // Aborted by either side, file removed, or peer disconnected
+      if (this._aborted) return;
       if (!(data.peer_id in this._remotePeers)) return;
       if (this._remotePeers[data.peer_id].aborted) return;
       if (dc.readyState !== 'open') return;
@@ -278,11 +281,16 @@ export class File {
 
   abort() {
     this._aborted = true
+    // Tear the receive down now rather than waiting for the next chunk — if the sender
+    // has already flushed its bytes (or stalled), no more chunks arrive and the sink,
+    // per-file peer, and in-progress flag would otherwise leak.
+    if (this._in_progress && this._conn) this._terminateReceive(this._conn, 'aborted')
   }
 
   remove() {
     this._aborted = true
     this._removed = true
+    if (this._in_progress && this._conn) this._terminateReceive(this._conn, 'removed')
   }
 
   _handleOpen(id, resolve) {
@@ -318,6 +326,7 @@ export class File {
     // Receiver side — incoming connection from the sender. Don't reset _aborted here:
     // an abort issued during setup must survive (reset happens at download start instead).
     else {
+      this._conn = conn
       this._transferred = 0
       this._lastProgressReportAt = 0
     }
@@ -328,10 +337,12 @@ export class File {
     if (!peer) return;
     const pc = peer.conn ? peer.conn.peerConnection : null;
     const state = pc ? pc.iceConnectionState : null;
-    // Any terminal state ('disconnected', 'failed', 'closed') means the connection is
-    // gone; treat null pc the same way. Without covering 'closed'/'failed' we leak the
-    // interval when the connection is torn down via our explicit close paths.
-    if (pc === null || state === 'disconnected' || state === 'failed' || state === 'closed') {
+    // 'failed'/'closed' (and a null pc) are terminal. 'disconnected' is often transient
+    // and can recover, so only give up if it persists past a short grace window —
+    // otherwise a brief network blip would needlessly abort an in-progress transfer.
+    peer.disconnectedSince = state === 'disconnected' ? (peer.disconnectedSince || Date.now()) : null;
+    const gaveUp = peer.disconnectedSince && (Date.now() - peer.disconnectedSince) > ICE_DISCONNECT_GRACE_MS;
+    if (pc === null || state === 'failed' || state === 'closed' || gaveUp) {
       clearInterval(peer.interval);
       peer.interval = null;
       if (peer.progress != 100) peer.aborted = true;
@@ -417,6 +428,7 @@ export class File {
       this._zipController = null;
     }
     try { if (this._peer) this._peer.destroy(); } catch {}
+    this._conn = null;
     this._in_progress = false;
   }
 
