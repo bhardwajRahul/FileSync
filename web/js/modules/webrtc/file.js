@@ -315,10 +315,10 @@ export class File {
       this._remotePeers[conn.peer].conn = conn
       resolve()
     }
-    // Receiver side — incoming connection from the sender.
+    // Receiver side — incoming connection from the sender. Don't reset _aborted here:
+    // an abort issued during setup must survive (reset happens at download start instead).
     else {
       this._transferred = 0
-      this._aborted = false
       this._lastProgressReportAt = 0
     }
   }

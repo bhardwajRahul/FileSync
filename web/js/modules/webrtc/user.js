@@ -381,6 +381,9 @@ export class User {
       return;
     }
 
+    // Clear any abort state from a prior attempt so this fresh download starts clean.
+    file._aborted = false;
+
     // Open the sink first, inside the user-gesture window. All sink modes are opened
     // here, before any WebRTC work:
     //   - FS Access needs a transient user gesture to show the save picker.
@@ -644,6 +647,7 @@ export class User {
         file.setZipController(controller);
         file.zip = true;
         file.in_progress = true;
+        file._aborted = false;  // fresh start; stream cancel() re-sets this
 
         try {
           await file.init();
