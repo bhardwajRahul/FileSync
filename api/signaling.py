@@ -309,11 +309,10 @@ async def signaling(websocket: WebSocket):
                 except Exception:
                     pass
                 return
-            if len(raw) > _MAX_PAYLOAD_BYTES:
-                await _send_json_safe(websocket, {"type": "error", "code": "invalid-message", "message": "Message too large."})
-                continue
-
-            # Rate limit
+            # Rate limit. Counted before the size check so oversize frames can't be
+            # streamed indefinitely without ever tripping the limiter. (The transport
+            # itself caps frame size via uvicorn's --ws-max-size, so a single frame
+            # can never buffer more than that.)
             now = time.monotonic()
             msg_timestamps.append(now)
             window_start = now - 1.0
@@ -322,6 +321,10 @@ async def signaling(websocket: WebSocket):
                 await _send_json_safe(websocket, {"type": "error", "code": "rate-limited", "message": "Too many messages."})
                 await websocket.close(code=_CLOSE_RATE_LIMITED)
                 return
+
+            if len(raw) > _MAX_PAYLOAD_BYTES:
+                await _send_json_safe(websocket, {"type": "error", "code": "invalid-message", "message": "Message too large."})
+                continue
 
             try:
                 msg = json.loads(raw)
