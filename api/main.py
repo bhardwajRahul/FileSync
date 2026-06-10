@@ -14,8 +14,10 @@ from api.signaling import router as signaling_router
 # Get environment variables. SECRET_KEY signs both the TURN HMAC credentials and the JWT,
 # so refuse to start without it rather than failing later at request time.
 SECRET_KEY = os.getenv("SECRET_KEY")
-if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY environment variable is required.")
+if not SECRET_KEY or SECRET_KEY == "<SECRET_KEY>":
+    # Also reject the compose files' literal placeholder — it is a publicly known
+    # value, so running with it would silently let anyone mint TURN credentials.
+    raise RuntimeError("SECRET_KEY environment variable is required (replace the <SECRET_KEY> placeholder with a real secret).")
 
 # Init FastAPI
 app = FastAPI(title='FileSync API', version='4.0.0', root_path="/api")
