@@ -420,7 +420,14 @@ export class File {
     try { conn.dataChannel.send(JSON.stringify({ type: 'abort', reason })); } catch {}
     try { conn.close(); } catch {}
     if (this._sink) {
-      this._sink.abort(reason).catch(() => {});
+      // Queue the abort behind any in-flight writes: FileSystemWritableFileStream
+      // holds a lock while a write is pending, so an immediate abort() would reject
+      // and leave the partial file (and its write lock) behind. Chaining onto
+      // _writeChain guarantees the abort runs once the stream is unlocked, and
+      // nulling _sink stops _onChunk from queueing further writes.
+      const sink = this._sink;
+      const chain = (this._writeChain || Promise.resolve()).catch(() => {});
+      this._writeChain = chain.then(() => sink.abort(reason)).catch(() => {});
       this._sink = null;
     }
     if (this._zip && this._zipController) {
@@ -540,6 +547,12 @@ export class File {
     // Peer so its signaling socket isn't left dangling.
     if (this._transferred < this._size && this._in_progress) {
       this._terminateReceive(conn, 'connection-closed');
+    } else if (this._in_progress && this._sink && this._transferred >= this._size) {
+      // Every byte arrived but the channel closed before the explicit 'end' frame
+      // (e.g. the sender's tab closed right after the last chunk). Finalize as a
+      // success instead of stranding the data in an unclosed sink and leaving the
+      // row stuck in_progress.
+      this._onEnd(conn);
     } else if (this._zip && this._zipController) {
       // Connection closed cleanly but in zip mode the controller is still pending —
       // happens if the sender closed without sending an explicit 'end'. Treat as abort.

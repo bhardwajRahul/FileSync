@@ -695,6 +695,10 @@ export class User {
       if (this._downloadAll.active) {
         await zipSink.close();
         success = true;
+        // Release the guard so subsequent single-file downloads aren't blocked
+        // (downloadFile checks _downloadAll?.active). The progress interval's next
+        // tick clears itself and the 100% branch renders the success UI.
+        this._downloadAll.active = false;
       } else {
         await zipSink.abort('user-aborted');
       }
