@@ -30,8 +30,8 @@ RUN find /install/lib/ -path "*/site-packages/tests" -type d -exec rm -rf {} + \
 # ==============================
 FROM python:3.14-alpine
 
-# Install Nginx runtime
-RUN apk add --no-cache nginx
+# Install Nginx runtime (+ bash for a reliable `wait -n` in the start command)
+RUN apk add --no-cache nginx bash
 
 WORKDIR /filesync
 
@@ -52,5 +52,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Expose ports
 EXPOSE 80
 
-# Start FastAPI + Nginx
-CMD ["sh", "-c", "python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 & nginx -g 'daemon off;'"]
+# Start FastAPI + Nginx. bash's `wait -n` returns as soon as EITHER process exits, so the
+# container stops (and `restart: unless-stopped` restarts it) if the backend dies —
+# instead of nginx keeping a half-dead container alive indefinitely. (busybox sh's
+# `wait -n` does not reliably fire for a backgrounded child as PID 1, so we use bash.)
+# --ws-max-size caps WebSocket frames at the transport (uvicorn's default is 16 MiB,
+# which would be fully buffered before the app's own 32 KiB payload check runs);
+# 64 KiB leaves headroom over the signaling _MAX_PAYLOAD_BYTES limit.
+CMD ["bash", "-c", "python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --ws-max-size 65536 & nginx -g 'daemon off;' & wait -n"]

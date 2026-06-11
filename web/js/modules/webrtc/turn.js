@@ -5,16 +5,30 @@ class Turn {
 
   getServers = async () => {
     await this._getCredentials();
+    // Use the hostname as the page is served from. We deliberately do NOT substitute
+    // 'localhost' for '127.0.0.1' here: Firefox blocks loopback IP literals in ICE
+    // candidate gathering as a privacy measure (prevents fingerprinting local services)
+    // but accepts the literal 'localhost' for TCP-based transports. Substituting would
+    // strictly worsen Firefox behavior in localhost dev mode while changing nothing in
+    // Chrome. In any non-loopback deployment (LAN IP, public IP, domain) both browsers
+    // work identically — this code path simply returns whatever the operator's users
+    // typed in the address bar.
+    const host = window.location.hostname;
+    // Provide both UDP and TCP TURN URLs. The browser's ICE agent will prefer UDP
+    // when reachable (lower overhead, lower latency) and silently fall back to TCP
+    // when UDP is blocked — a common case on corporate networks, some mobile carriers,
+    // and most public Wi-Fi captive portals. coturn listens for both on port 3478.
     return [
+      { urls: `stun:${host}:3478` },
       {
-        urls: `stun:${window.location.hostname}:3478`
-      },
-      {
-        urls: `turn:${window.location.hostname}:3478`,
+        urls: [
+          `turn:${host}:3478`,
+          `turn:${host}:3478?transport=tcp`,
+        ],
         username: this._username,
         credential: this._credential,
-      }
-    ]
+      },
+    ];
   }
 
   _getCredentials = async () => {

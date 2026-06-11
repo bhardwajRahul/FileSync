@@ -1,6 +1,30 @@
 import { dom } from '../dom.js';
 import { turn } from './turn.js';
+import { applyIceMode } from './mode.js';
 import { File } from './file.js';
+import { Peer } from './peer.js';
+import { openSink, sinkState } from '../sink.js';
+import { downloadZip } from '../../vendors/client-zip.min.js';
+
+// Hard limits on user-controlled string fields received from the network. The display
+// name and filename are interpolated into the DOM (always via textContent — see XSS
+// hardening below); the id fields are used as DOM id suffixes and in inline event
+// handlers, so they must match a strict charset.
+const _ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const _MAX_NAME_LEN = 200;
+const _MAX_FILENAME_LEN = 1024;
+
+const _isValidId = (s) => typeof s === 'string' && _ID_RE.test(s);
+const _sanitizeName = (s, max = _MAX_NAME_LEN) =>
+  (typeof s === 'string' ? s : '').slice(0, max);
+
+// Cap on simultaneous outbound file transfers from a single sender. Each in-flight
+// transfer opens its own RTCPeerConnection + DataChannel; an unbounded fan-out in a
+// busy room can exhaust the sender's browser (Chrome's per-page PC cap is ~256, and
+// each DC carries a ~16 MiB SCTP buffer). 5 is enough to saturate typical upstream
+// bandwidth while leaving comfortable headroom; excess requests are queued and the
+// receivers are told they're waiting.
+const _OUTBOUND_CONCURRENCY_CAP = 5;
 
 export class User {
   _name = this._generate_name();
@@ -14,6 +38,9 @@ export class User {
   _downloadAll;
   _reconnectAttempts = 0;
   _reconnectTimer = null;
+  // Outbound-transfer fan-out control. See _OUTBOUND_CONCURRENCY_CAP.
+  _outboundActive = 0;
+  _outboundQueue = [];  // each entry is the original `data` from webrtc-file-download
 
   constructor(room_id) {
     this._room_id = room_id;
@@ -54,44 +81,47 @@ export class User {
   }
 
   async init(peer_id = null) {
-    // Get UUID
+    // Get UUID. A fetch failure here just propagates — caller (script.js onLoad)
+    // is responsible for showing the user-facing error.
     if (peer_id == null) peer_id = await this._getUUID();
 
-    // Get ICE servers
+    // Get ICE servers. Don't reach into the global error_div from here — let the
+    // caller decide. Symmetric to file.init's contract after Round-3.
     let iceServers;
     try {
       iceServers = await turn.getServers();
     } catch (err) {
-      console.log(err)
-      dom.transfer_div.style.display = 'none'
-      dom.connect_div.style.display = 'none'
-      dom.error_div.style.display = 'block'
-      dom.error_message.innerHTML = 'An error occurred getting the ICE servers. Please try again later.'
-      return
+      console.warn('user.init: failed to get ICE servers:', err);
+      throw err;
     }
 
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       // Create a new Peer instance
       const isSecure = window.location.protocol === 'https:';
       this._peer = new Peer(peer_id, {
         host: window.location.hostname,
         port: parseInt(window.location.port) || (isSecure ? 443 : 80),
-        path: "/peerjs",
         secure: isSecure,
-        config: {
-          iceServers: iceServers,
-          // iceTransportPolicy: "relay",  // Force TURN
-        }
+        config: applyIceMode({ iceServers }),
       });
+
+      // Settle init exactly once. Pre-'open' errors fail init outright so the caller
+      // can show a fatal-error UI instead of having `await user.init()` hang while
+      // _scheduleReconnect spins quietly in the background.
+      let settled = false;
+      const settle = (cb, arg) => { if (settled) return; settled = true; cb(arg); };
 
       // Emitted when a connection to the PeerServer is established.
       this._peer.on('open', () => {
+        // Reset reconnect bookkeeping on every (re-)open. Only the first open
+        // settles init; subsequent ones (reconnect after a blip) keep the existing
+        // resolve a no-op.
         this._reconnectAttempts = 0;
         if (this._reconnectTimer) {
           clearTimeout(this._reconnectTimer);
           this._reconnectTimer = null;
         }
-        this._handleOpen(resolve);
+        if (!settled) this._handleOpen(() => settle(resolve));
       });
 
       // Emitted when a new data connection is established from a remote peer.
@@ -100,25 +130,53 @@ export class User {
       // Emitted when the peer is disconnected from the signaling server.
       this._peer.on('disconnected', () => this._handleDisconnected());
 
-      // Errors on the peer are almost always fatal and will destroy the peer.
-      this._peer.on('error', (err) => this._handleError(err));
+      // Errors on the peer. Pre-'open' errors fail init (caller bails). Post-'open'
+      // errors go to the normal handler so the reconnect/fatal-UI paths keep
+      // working for an already-established session.
+      this._peer.on('error', (err) => {
+        if (settled) {
+          this._handleError(err);
+        } else {
+          // Destroy the half-initialized Peer so its signaling WebSocket isn't left
+          // dangling. The caller will null its own reference to user._peer.
+          try { this._peer?.destroy(); } catch {}
+          settle(reject, err);
+        }
+      });
     })
   }
 
   async connect(peer_id) {
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       // Establish a connection with the host.
       const conn = this._peer.connect(peer_id);
 
-      // Emitted when the peer connection has established connection to the host.
-      conn.on('open', () => this._handleConnection(conn, resolve));
+      // Settle exactly once. Listening for error/close in addition to open guarantees
+      // we don't hang here forever when the host is unreachable (peer-unavailable,
+      // ICE failure) — the caller in script.js can then show an error UI.
+      let settled = false;
+      const settle = (cb, arg) => { if (settled) return; settled = true; cb(arg); };
+
+      conn.on('open', () => this._handleConnection(conn, () => settle(resolve)));
+      conn.on('error', (err) => settle(reject, err));
+      conn.on('close', () => settle(reject, new Error('Connection closed before open.')));
     })
   }
 
   _isAlive(peer_id) {
-    if (this._remotePeers[peer_id] === undefined || this._remotePeers[peer_id].conn.peerConnection === null || this._remotePeers[peer_id].conn.peerConnection.iceConnectionState == 'disconnected') {
-      clearInterval(this._remotePeers[peer_id].interval);
-      this._handleClose(this._remotePeers[peer_id].conn);
+    const peer = this._remotePeers[peer_id];
+    if (peer === undefined) return;
+    const pc = peer.conn ? peer.conn.peerConnection : null;
+    const state = pc ? pc.iceConnectionState : null;
+    // 'failed'/'closed' (and a null pc) are terminal. 'disconnected' is often transient
+    // and can recover, so only treat it as gone after a short grace window — otherwise a
+    // brief blip would drop a peer that WebRTC would have reconnected on its own.
+    peer.disconnectedSince = state === 'disconnected' ? (peer.disconnectedSince || Date.now()) : null;
+    const gaveUp = peer.disconnectedSince && (Date.now() - peer.disconnectedSince) > 4000;
+    if (pc === null || state === 'failed' || state === 'closed' || gaveUp) {
+      clearInterval(peer.interval);
+      peer.interval = null;
+      this._handleClose(peer.conn);
     }
   }
 
@@ -127,10 +185,10 @@ export class User {
     resolve()
   }
 
-  // Handles disconnection from the PeerJS signaling server.
+  // Handles disconnection from the signaling server.
   _handleDisconnected() {
     if (this._peer.destroyed) return;
-    console.warn('Lost connection to PeerJS server. Attempting to reconnect...');
+    console.warn('Lost connection to signaling server. Attempting to reconnect...');
     this._scheduleReconnect();
   }
 
@@ -154,7 +212,7 @@ export class User {
 
     const delay = 1000 * Math.pow(2, this._reconnectAttempts);
     this._reconnectAttempts++;
-    console.log(`Reconnect attempt ${this._reconnectAttempts}/${maxAttempts} in ${delay}ms...`);
+    console.warn(`Reconnect attempt ${this._reconnectAttempts}/${maxAttempts} in ${delay}ms...`);
 
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
@@ -183,6 +241,10 @@ export class User {
       return
     }
 
+    // Clamp to a sane length before doing anything else — defends downstream renderers
+    // and matches the limit we apply to inbound names from other peers.
+    value = _sanitizeName(value);
+
     // Check if there is another user with the same name
     const duplicated = Object.entries(this._remotePeers).some(([k, v]) => v.name == value && k != this._peer.id)
     if (duplicated) {
@@ -198,13 +260,13 @@ export class User {
     for (let f of Object.values(this._files)) {
       if (f.owner_id == this._peer.id) {
         f.owner_name = this._name
-        document.getElementById(`file-${f.id}-info`).innerHTML = `${this._parseBytes(f.size)} | Sent by ${f.owner_id == this._peer.id ? `${f.owner_name} (You)` : f.owner_name }`
+        this._setFileInfoText(f)
       }
     }
 
     if (this._isHost) {
       // Update UI
-      document.getElementById('transfer-users-list-host-name').innerHTML = `${this._name} (You)`
+      document.getElementById('transfer-users-list-host-name').textContent = `${this._name} (You)`
 
       // Notify all peers
       const peers_list = [{"id": this._peer.id, "name": this._name }, ...Object.entries(this._remotePeers).map(([k, v]) => ({"id": k, "name": v.name}))];
@@ -214,7 +276,7 @@ export class User {
     }
     else {
       // Update UI
-      document.getElementById(`user-${this._peer.id}-name`).innerHTML = `${this._name} (You)`
+      document.getElementById(`user-${this._peer.id}-name`).textContent = `${this._name} (You)`
 
       // Notify Host
       this._remotePeers[this._room_id].conn.send({'webrtc-user-name': {"id": this._peer.id, "name": this._name}})
@@ -289,6 +351,9 @@ export class User {
   removeFile(fileId) {
     this._files[fileId]._aborted = true
     this._files[fileId]._removed = true
+    // Stop any in-flight outbound transfers immediately (the send loop checks both the
+    // file-level _aborted and the per-receiver aborted flag).
+    for (const p of Object.values(this._files[fileId]._remotePeers)) p.aborted = true
 
     // Notify all peers
     for (let peer of Object.values(this._remotePeers)) {
@@ -306,6 +371,61 @@ export class User {
 
   // Download a file shared by another peer
   async downloadFile(fileId) {
+    const file = this._files[fileId];
+    if (!file) return;
+
+    // Guard against double-trigger races. Two paths can collide:
+    //   1. Double-click on the Download button before openSink resolves → two save
+    //      pickers, two SW iframes, two per-file Peers.
+    //   2. Clicking Download mid-downloadAll → the file is already wired into the zip
+    //      iterator (_zip=true, _zipController set). A second sink would be opened but
+    //      never written to (_onChunk routes to the zip controller), leaking a save
+    //      dialog or SW iframe.
+    if (file.in_progress || this._downloadAll?.active) {
+      if (window.showToast) window.showToast('This file is already downloading.', 'warning');
+      return;
+    }
+
+    // Clear any abort state from a prior attempt so this fresh download starts clean.
+    file._aborted = false;
+
+    // Open the sink first, inside the user-gesture window. All sink modes are opened
+    // here, before any WebRTC work:
+    //   - FS Access needs a transient user gesture to show the save picker.
+    //   - SW needs the iframe navigation to fire from a click (popup-blocker friendly).
+    //   - Blob is gesture-independent but uses the same path for consistency.
+    // The receiver-side _onHeader uses this pre-opened sink as-is — it must not open a
+    // second one (would cause two save pickers / two browser downloads).
+    try {
+      file._sink = await openSink({
+        id: file.id,
+        name: file.name,
+        size: file.size,
+        mime: 'application/octet-stream',
+      });
+      // If the user cancels the browser download (closes the download tray / deletes
+      // the in-progress entry), the SW sink fires this hook — propagate it as a
+      // transfer abort so the sender stops pumping bytes into a dead stream.
+      if (file._sink && 'mode' in file._sink) file._sink._onCancel = () => file.abort();
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        // User dismissed the save picker — silently restore the UI.
+        return;
+      }
+      console.error('Failed to open sink:', err);
+      const errEl = document.getElementById(`file-${fileId}-error`);
+      if (errEl) {
+        errEl.style.display = 'block';
+        errEl.innerHTML = 'Could not start the download. Please try again.';
+      }
+      return;
+    }
+
+    // Mark the file as in-progress now that we hold an open sink. This lets
+    // file._handleClose() recognize that a clean abort + sink teardown is needed if the
+    // sender disconnects before the transfer header arrives.
+    file.in_progress = true;
+
     // Update UI: Remove Download button and add loading icon
     document.getElementById(`file-${fileId}-download`).style.display = 'none'
     document.getElementById(`file-${fileId}-error`).innerHTML = ''
@@ -316,11 +436,40 @@ export class User {
     document.getElementById(`file-${fileId}-icon-loading`).style.display = 'block'
     document.getElementById(`file-${fileId}-progress`).innerHTML = '0% | '
 
-    // Init Peering connection to receive the file
-    await this._files[fileId].init()
+    // Init Peering connection to receive the file. file.init now throws on
+    // ICE-server failure or signaling-server unreachability — without the catch,
+    // dereferencing file.peer.id below would throw and the row would stay stuck
+    // on the loading spinner.
+    try {
+      await file.init()
+    } catch (err) {
+      console.warn('downloadFile: file.init failed:', err);
+      // Roll back the per-file state we set up before init.
+      if (file._sink) {
+        file._sink.abort('init-failed').catch(() => {});
+        file._sink = null;
+      }
+      // Drop the reference to the half-initialized Peer (already destroyed inside
+      // init on the reject path) so a retry from the user starts cleanly.
+      file._peer = null;
+      file.in_progress = false;
+      // Restore the row UI to its pre-click state with an error message.
+      const errEl = document.getElementById(`file-${fileId}-error`);
+      if (errEl) {
+        errEl.style.display = 'block';
+        errEl.innerHTML = 'Could not start the download. Please try again.';
+      }
+      const dl = document.getElementById(`file-${fileId}-download`);
+      const abortEl = document.getElementById(`file-${fileId}-abort`);
+      const loading = document.getElementById(`file-${fileId}-icon-loading`);
+      if (dl) dl.style.display = 'block';
+      if (abortEl) abortEl.style.display = 'none';
+      if (loading) loading.style.display = 'none';
+      return;
+    }
 
     // If it's the host redirect the request to the Origin's Peer. Otherwise send the request to the Host.
-    this._remotePeers[this._isHost ? this._files[fileId].owner_id : this._room_id].conn.send({'webrtc-file-download': {"file_id": fileId, "requester_id": this._peer.id, "requester_name": this._name, "peer_id": this._files[fileId].peer.id}})
+    this._remotePeers[this._isHost ? file.owner_id : this._room_id].conn.send({'webrtc-file-download': {"file_id": fileId, "requester_id": this._peer.id, "requester_name": this._name, "peer_id": file.peer.id}})
   }
 
   // Abort a file that is already being downloaded
@@ -366,31 +515,52 @@ export class User {
     const tableWrap = document.getElementById('file-modal-table-wrap')
     if (tableWrap) tableWrap.style.display = hasDetails ? 'block' : 'none'
 
-    // Build table
-    dom.file_modal_table.querySelector('tbody').innerHTML = ''
+    // Build table imperatively so user.user_name is inserted via textContent rather
+    // than concatenated into an HTML string.
+    const tbody = dom.file_modal_table.querySelector('tbody');
+    tbody.innerHTML = '';
     for (let user of Object.values(details)) {
-      const statusColor = user.progress == 100 ? '#198754' : user.aborted ? '#DC3545' : '#0d6efd'
-      const statusLabel = user.progress == 100 ? 'Completed' : user.aborted ? 'Stopped' : 'In progress'
-      const statusBg = user.progress == 100 ? 'rgba(25,135,84,0.1)' : user.aborted ? 'rgba(220,53,69,0.1)' : 'rgba(13,110,253,0.1)'
-      dom.file_modal_table.querySelector('tbody').innerHTML += `
-        <tr>
-          <td style="padding:12px 16px; font-weight:500; font-size:14px; color:var(--color-h1); vertical-align:middle; border-bottom:1px solid var(--color-border);">${user.user_name}</td>
-          <td style="padding:12px 16px; vertical-align:middle; border-bottom:1px solid var(--color-border); min-width:120px;">
-            <div style="display:flex; align-items:center; gap:8px;">
-              <div style="flex:1; height:6px; background-color:var(--color-card-header-bg); border-radius:3px; overflow:hidden;">
-                <div style="width:${user.progress}%; height:100%; background-color:${statusColor}; border-radius:3px; transition:width 0.3s ease;"></div>
-              </div>
-              <span style="font-size:13px; font-weight:500; color:var(--color-muted); min-width:32px; text-align:right;">${user.progress}%</span>
-            </div>
-          </td>
-          <td style="padding:12px 16px; vertical-align:middle; border-bottom:1px solid var(--color-border);">
-            <span style="display:inline-block; padding:3px 10px; font-size:12px; font-weight:600; color:${statusColor}; background-color:${statusBg}; border-radius:20px;">${statusLabel}</span>
-          </td>
-          <td style="padding:12px 16px; vertical-align:middle; text-align:center; border-bottom:1px solid var(--color-border);">
-            <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background-color:${user.online ? '#198754' : '#DC3545'}; box-shadow:0 0 0 3px ${user.online ? 'rgba(25,135,84,0.2)' : 'rgba(220,53,69,0.2)'};"></span>
-          </td>
-        </tr>
-      `
+      const statusColor = user.progress == 100 ? '#198754' : user.aborted ? '#DC3545' : '#0d6efd';
+      const statusLabel = user.progress == 100 ? 'Completed' : user.aborted ? 'Stopped' : 'In progress';
+      const statusBg    = user.progress == 100 ? 'rgba(25,135,84,0.1)' : user.aborted ? 'rgba(220,53,69,0.1)' : 'rgba(13,110,253,0.1)';
+      const onlineColor = user.online ? '#198754' : '#DC3545';
+      const onlineRing  = user.online ? 'rgba(25,135,84,0.2)' : 'rgba(220,53,69,0.2)';
+
+      const tr = document.createElement('tr');
+
+      const nameTd = document.createElement('td');
+      nameTd.style.cssText = 'padding:12px 16px; font-weight:500; font-size:14px; color:var(--color-h1); vertical-align:middle; border-bottom:1px solid var(--color-border);';
+      nameTd.textContent = user.user_name;
+      tr.appendChild(nameTd);
+
+      const progressTd = document.createElement('td');
+      progressTd.style.cssText = 'padding:12px 16px; vertical-align:middle; border-bottom:1px solid var(--color-border); min-width:120px;';
+      progressTd.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div style="flex:1; height:6px; background-color:var(--color-card-header-bg); border-radius:3px; overflow:hidden;">
+            <div style="width:${user.progress}%; height:100%; background-color:${statusColor}; border-radius:3px; transition:width 0.3s ease;"></div>
+          </div>
+          <span style="font-size:13px; font-weight:500; color:var(--color-muted); min-width:32px; text-align:right;">${user.progress}%</span>
+        </div>
+      `;
+      tr.appendChild(progressTd);
+
+      const statusTd = document.createElement('td');
+      statusTd.style.cssText = 'padding:12px 16px; vertical-align:middle; border-bottom:1px solid var(--color-border);';
+      const statusBadge = document.createElement('span');
+      statusBadge.style.cssText = `display:inline-block; padding:3px 10px; font-size:12px; font-weight:600; color:${statusColor}; background-color:${statusBg}; border-radius:20px;`;
+      statusBadge.textContent = statusLabel;
+      statusTd.appendChild(statusBadge);
+      tr.appendChild(statusTd);
+
+      const onlineTd = document.createElement('td');
+      onlineTd.style.cssText = 'padding:12px 16px; vertical-align:middle; text-align:center; border-bottom:1px solid var(--color-border);';
+      const onlineDot = document.createElement('span');
+      onlineDot.style.cssText = `display:inline-block; width:10px; height:10px; border-radius:50%; background-color:${onlineColor}; box-shadow:0 0 0 3px ${onlineRing};`;
+      onlineTd.appendChild(onlineDot);
+      tr.appendChild(onlineTd);
+
+      tbody.appendChild(tr);
     }
   }
 
@@ -409,108 +579,162 @@ export class User {
     // Get available files to download
     const files = Object.values(this._files).filter(x => x.owner_id != this._peer.id && !x.removed)
 
-    // Check if at least there is a file to be downloaded
     if (files.length == 0) {
       if (window.showToast) window.showToast("There are no files to be downloaded.", 'warning')
       return
     }
 
-    // Check how to know if user is downloading any files (check file is not from the owner)
     const inProgress = Object.values(this._files).some(x => x.in_progress)
-
-    // Show notification modal
     if (inProgress) {
       if (window.showToast) window.showToast("Files are still downloading.", 'warning')
       return
     }
 
-    // Show download all modal
+    // Open the sink for files.zip up-front, within the user-gesture window.
+    let zipSink;
+    try {
+      zipSink = await openSink({
+        id: `bundle-${Date.now()}`,
+        name: 'files.zip',
+        size: undefined,
+        mime: 'application/zip',
+      });
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      console.error('Failed to open sink for zip:', err);
+      if (window.showToast) window.showToast('Could not start the download.', 'warning');
+      return;
+    }
+
+    // Show download all modal (only after the save dialog is confirmed)
     const modal = new bootstrap.Modal(dom.download_modal, {
       backdrop: 'static',
-      keyboard: false
+      keyboard: false,
     })
     modal.show()
 
-    // Create a new zip file
-    const zip = new JSZip();
-
-    // Start downloading all files, one by one
     this._downloadAll = {
-      "active": true,
-      "aborted": false,
-      "file": null,
-      "current": 0,
-      "sizes": files.map(x => x.size),
-      "interval": setInterval(() => this._downloadAllProgress(), 500),
+      active: true,
+      aborted: false,
+      file: null,
+      current: 0,
+      sizes: files.map(x => x.size),
+      interval: setInterval(() => this._downloadAllProgress(), 500),
     };
 
-    for (let file of files) {
-      // Check if current file has been removed by the owner
-      if (file.removed) this._downloadAll.active = false
+    // Wire browser-side cancel AFTER _downloadAll state is initialized — the hook
+    // calls downloadAllCancel() which reads this._downloadAll. (downloadAllCancel
+    // handles the UI-button path; this covers the download-tray path.)
+    if (zipSink && 'mode' in zipSink) zipSink._onCancel = () => this.downloadAllCancel();
 
-      // Check if the file is still active
-      if (!this._downloadAll.active) break
+    // Async iterator that pulls one file at a time. client-zip advances to the next
+    // file only after fully consuming the previous file's ReadableStream — which
+    // matches our serial transfer model exactly.
+    const self = this;
+    async function* filesIterator() {
+      for (const file of files) {
+        if (file.removed) self._downloadAll.active = false;
+        if (!self._downloadAll.active) break;
 
-      // Store current file being processed
-      this._downloadAll.file = file
-      this._downloadAll.current += 1
+        self._downloadAll.file = file;
+        self._downloadAll.current += 1;
 
-      // Init Peering connection to receive the file
-      await file.init()
+        // Each file gets its own ReadableStream; the controller is handed to the
+        // File instance so its WebRTC receive path can enqueue chunks directly.
+        let controller;
+        const stream = new ReadableStream({
+          start(c) { controller = c; },
+          cancel() {
+            file._aborted = true;
+            self._downloadAll.active = false;
+          },
+        });
+        file.setZipController(controller);
+        file.zip = true;
+        file.in_progress = true;
+        file._aborted = false;  // fresh start; stream cancel() re-sets this
 
-      // Mark the file to be in progress
-      file.in_progress = true
-
-      // State to convert the file in zip, instead of downloading it
-      file.zip = true
-
-      // Initiate the request to the file's owner to download the file
-      this._remotePeers[this._isHost ? file.owner_id : this._room_id].conn.send({'webrtc-file-download': {"file_id": file.id, "requester_id": this._peer.id, "requester_name": this._name, "peer_id": file.peer.id}})
-
-      // Wait until file finishes downloading
-      await this._waitFileTranster(file)
-
-      // Check if file was aborted
-      if (file.aborted) {
-        this._downloadAll.active = false
-      }
-      else {
-        // Add files to the zip
-        zip.file(file.name, new Blob(file.chunks))
-
-        // Clean file from memory
-        file.chunks = []
-      }
-    }
-
-    // Download ZIP file
-    if (this._downloadAll.active) {
-      // Generate the zip file as a Blob
-      const zipBlob = await zip.generateAsync({ type: "blob" });
-
-      // Download the zip file
-      const downloadLink = document.createElement('a');
-      downloadLink.href = URL.createObjectURL(zipBlob);
-      downloadLink.download = 'files.zip';
-      downloadLink.click();
-    }
-
-    // Disable zip mode
-    for (let file of Object.values(this._files)) file.zip = false
-  }
-
-  _waitFileTranster(file) {
-    return new Promise((resolve) => {
-      const checkInterval = setInterval(() => {
-        if (!file.in_progress) {
-          clearInterval(checkInterval);
-          resolve();
+        try {
+          await file.init();
+        } catch (err) {
+          console.error('File init failed:', err);
+          self._downloadAll.active = false;
+          break;
         }
-      }, 500);
-    });
+
+        // Kick the sender off.
+        self._remotePeers[self._isHost ? file.owner_id : self._room_id].conn.send({
+          'webrtc-file-download': {
+            file_id: file.id,
+            requester_id: self._peer.id,
+            requester_name: self._name,
+            peer_id: file.peer.id,
+          },
+        });
+
+        yield { name: file.name, input: stream, lastModified: new Date() };
+        // When yield returns, client-zip has fully consumed this file's stream
+        // (controller was closed by file._onEnd). Move on to the next.
+      }
+    }
+
+    // Pipe the zip stream into the chosen sink.
+    let success = false;
+    try {
+      const zipResponse = downloadZip(filesIterator());
+      const reader = zipResponse.body.getReader();
+      while (true) {
+        if (!this._downloadAll.active) {
+          try { await reader.cancel('user-aborted'); } catch {}
+          break;
+        }
+        const { value, done } = await reader.read();
+        if (done) break;
+        await zipSink.write(value);
+      }
+      if (this._downloadAll.active) {
+        await zipSink.close();
+        success = true;
+        // Release the guard so subsequent single-file downloads aren't blocked
+        // (downloadFile checks _downloadAll?.active). The progress interval's next
+        // tick clears itself and the 100% branch renders the success UI.
+        this._downloadAll.active = false;
+      } else {
+        await zipSink.abort('user-aborted');
+      }
+    } catch (err) {
+      console.error('Zip stream failed:', err);
+      try { await zipSink.abort(String(err)); } catch {}
+      this._downloadAll.active = false;
+    } finally {
+      // Tear down the in-flight file's per-file peer/connection so a cancel doesn't leak
+      // its signaling socket — the zip orchestration above doesn't otherwise close it.
+      const inflight = this._downloadAll.file;
+      if (inflight) {
+        try { if (inflight._conn) inflight._conn.close(); } catch {}
+        try { if (inflight._peer) inflight._peer.destroy(); } catch {}
+        inflight._conn = null;
+        inflight._peer = null;
+        inflight._in_progress = false;
+      }
+      for (const f of Object.values(this._files)) {
+        f.zip = false;
+        f.setZipController(null);
+      }
+    }
+
+    if (!success && !this._downloadAll.aborted) {
+      // Surface the failure in the progress modal.
+      this._downloadAll.active = false;
+    }
   }
 
   downloadAllCancel() {
+    // Defensive: ignore late cancels after the run has completed and _downloadAll has
+    // been reset (e.g., a browser-side cancel that fires moments after a successful
+    // close — see openSwSink _onCancel wiring).
+    if (!this._downloadAll) return;
+
     // Abort the downloadAll operation
     this._downloadAll.active = false
     this._downloadAll.aborted = true
@@ -526,10 +750,11 @@ export class User {
       clearInterval(this._downloadAll.interval)
     }
 
-    // Compute overall progress
+    // Compute overall progress (guard for the brief window before the first file starts)
     const totalSize = this._downloadAll.sizes.reduce((acc, size) => acc + size, 0);
-    const totalTransferred = this._downloadAll.sizes.slice(0, this._downloadAll.current - 1).reduce((acc, size) => acc + size, 0) + this._downloadAll.file.transferred;
-    const overallProgress = (totalTransferred / totalSize) * 100;
+    const currentTransferred = this._downloadAll.file ? this._downloadAll.file.transferred : 0;
+    const totalTransferred = this._downloadAll.sizes.slice(0, this._downloadAll.current - 1).reduce((acc, size) => acc + size, 0) + currentTransferred;
+    const overallProgress = totalSize > 0 ? (totalTransferred / totalSize) * 100 : 0;
 
     // Update UI
     dom.download_modal_value.innerHTML = `${Math.floor(overallProgress)}%`
@@ -557,9 +782,7 @@ export class User {
 
   // Emitted when the connection is established and ready-to-use (a peer connects to the host).
   async _handleConnection(conn, resolve) {
-    // console.log('Received connection from', conn.peer)
-
-    // Emitted when data is received from the remote peer. 
+    // Emitted when data is received from the remote peer.
     conn.on('data', (data) => this._handleData(conn, data));
 
     // Emitted when either you or the remote peer closes the data connection.
@@ -588,8 +811,6 @@ export class User {
 
   // Emitted when data is received from the remote peer.
   async _handleData(conn, data) {
-    // console.log("Received data from", conn.peer, data)
-
     if ('webrtc-connect' in data && this._isHost) {
       if (this._password.length != 0 && !('password' in data['webrtc-connect'])) {
         conn.send({'webrtc-connect-response': {"status": "password_required"}})
@@ -598,8 +819,10 @@ export class User {
         conn.send({'webrtc-connect-response': {"status": "password_invalid"}})
       }
       else {
-        // Add peer to the peers list
-        this._remotePeers[conn.peer] = {"name": data['webrtc-connect']['name'], "conn": conn,  "interval": setInterval(() => this._isAlive(conn.peer), 1000)}
+        // Add peer to the peers list. Clamp the inbound name to a sane length; it's
+        // user-controlled and gets rendered in every connected peer's DOM.
+        const cleanName = _sanitizeName(data['webrtc-connect']['name']);
+        this._remotePeers[conn.peer] = {"name": cleanName, "conn": conn,  "interval": setInterval(() => this._isAlive(conn.peer), 1000)}
 
         // Show peer connected status
         dom.transfer_status_wait.style.display = 'none'
@@ -608,8 +831,9 @@ export class User {
         // Define peers list (including host user)
         const peers_list = [{"id": this._peer.id, "name": this._name }, ...Object.entries(this._remotePeers).map(([k, v]) => ({"id": k, "name": v.name}))];
 
-        // Build user's list
-        this._addUserUI({"id": conn.peer, "name": data['webrtc-connect']['name']})
+        // Build user's list. conn.peer is the remote's peer id — already validated by
+        // the signaling server's id-format check at /ws register time.
+        this._addUserUI({"id": conn.peer, "name": this._remotePeers[conn.peer].name})
 
         // Send confirmation
         conn.send({'webrtc-connect-response': {"status": "welcome", "secured": this._password.trim().length != 0}})
@@ -645,24 +869,32 @@ export class User {
       }
     }
     else if ('webrtc-user-name' in data && this._isHost) {
+      const incoming = data['webrtc-user-name'];
+      // Reject malformed payloads from the wire. The id is used as a DOM id suffix
+      // and the name will be rendered in every peer's DOM.
+      if (!incoming || !_isValidId(incoming.id)) return;
+      if (!(incoming.id in this._remotePeers)) return;
+      const newName = _sanitizeName(incoming.name);
+
       // Update user
-      this._remotePeers[data['webrtc-user-name'].id].name = data['webrtc-user-name'].name
+      this._remotePeers[incoming.id].name = newName;
 
       // Update files
       for (let f of Object.values(this._files)) {
-        if (f.owner_id == data['webrtc-user-name'].id) {
-          f.owner_name = data['webrtc-user-name'].name
-          document.getElementById(`file-${f.id}-info`).innerHTML = `${this._parseBytes(f.size)} | Sent by ${f.owner_name}`
+        if (f.owner_id == incoming.id) {
+          f.owner_name = newName
+          this._setFileInfoText(f)
         }
         for (let p of Object.values(f.remotePeers)) {
-          if (p.user_id == data['webrtc-user-name'].id) {
-            p.user_name = data['webrtc-user-name'].name
+          if (p.user_id == incoming.id) {
+            p.user_name = newName
           }
         }
       }
 
       // Update UI
-      document.getElementById(`user-${data['webrtc-user-name'].id}-name`).innerHTML = data['webrtc-user-name'].name
+      const nameEl = document.getElementById(`user-${incoming.id}-name`);
+      if (nameEl) nameEl.textContent = newName;
 
       // Notify all peers
       const peers_list = [{"id": this._peer.id, "name": this._name }, ...Object.entries(this._remotePeers).map(([k, v]) => ({"id": k, "name": v.name}))];
@@ -679,30 +911,35 @@ export class User {
 
       // Process Connected Peers
       for (let p of data['webrtc-peers']) {
+        // Skip malformed entries from the wire — id must match the strict charset, and
+        // name is clamped to a sane length before being inserted into the DOM.
+        if (!_isValidId(p.id)) continue;
+        p.name = _sanitizeName(p.name);
+
         // Peer is the Host
         if (p.id == this._room_id) {
           this._remotePeers[p.id].name = p.name
-          dom.transfer_users_list_host_name.innerHTML = p.name
+          dom.transfer_users_list_host_name.textContent = p.name
         }
         // Peer is not the Host
         else {
-          // If peer is new, add it to the frontend
-          if (!(p.id in this._remotePeers)) this._addUserUI(p)
-          // If the peer is already stored, then only update name
-          else {
+          if (!(p.id in this._remotePeers)) {
+            // New peer — add UI and create the entry.
+            this._addUserUI(p)
+            this._remotePeers[p.id] = {"name": p.name}
+          } else {
+            // Existing entry — update name in place so any other fields on the entry
+            // (intervals, etc.) survive.
             this._remotePeers[p.id].name = p.name
-            document.getElementById(`user-${p.id}-name`).innerHTML = `${p.name} ${p.id == this._peer.id ? ' (You)' : ''}`
+            document.getElementById(`user-${p.id}-name`).textContent = `${p.name} ${p.id == this._peer.id ? ' (You)' : ''}`
           }
-
-          // Store user name
-          this._remotePeers[p.id] = {"name": p.name}
         }
 
         // Update files
         for (let f of Object.values(this._files)) {
           if (f.owner_id == p.id) {
             f.owner_name = p.name
-            document.getElementById(`file-${f.id}-info`).innerHTML = `${this._parseBytes(f.size)} | Sent by ${f.owner_id == this._peer.id ? `${p.name} (You)` : p.name }`
+            this._setFileInfoText(f)
           }
         }
       }
@@ -715,17 +952,23 @@ export class User {
         }
       }
 
-      // Process files
-      if ('webrtc-files' in data) {
-        for (let file of data['webrtc-files'].filter(x => !(x.id in this._files))) {
-          // Create file instance
-          const f = new File(file)
+      // Process files. Reject malformed entries from the wire (same checks as _onFileAdd).
+      if (Array.isArray(data['webrtc-files'])) {
+        for (let file of data['webrtc-files']) {
+          if (!file || typeof file !== 'object') continue;
+          if (!_isValidId(file.id) || !_isValidId(file.owner_id)) continue;
+          if (typeof file.size !== 'number' || !Number.isFinite(file.size) || file.size < 0) continue;
+          if (file.id in this._files) continue;
 
-          // Add file to the current user
-          this._files[f.id] = f
-
-          // Add file to the list
-          this._addFileUI(f)
+          const f = new File({
+            id: file.id,
+            name: _sanitizeName(file.name, _MAX_FILENAME_LEN),
+            size: file.size,
+            owner_id: file.owner_id,
+            owner_name: _sanitizeName(file.owner_name),
+          });
+          this._files[f.id] = f;
+          this._addFileUI(f);
         }
       }
     }
@@ -738,7 +981,14 @@ export class User {
     else if ('webrtc-file-download' in data && conn.peer in this._remotePeers) {
       this._onFileDownload(data['webrtc-file-download'])
     }
-    else conn.close()
+    else if ('webrtc-file-queued' in data && conn.peer in this._remotePeers) {
+      this._onFileQueued(data['webrtc-file-queued'])
+    }
+    else {
+      // Unknown message type — log and ignore. Tearing down the connection here would
+      // break compatibility with peers running a newer protocol that adds message types.
+      console.warn('Ignoring unknown message from', conn.peer, Object.keys(data || {}));
+    }
   }
 
   // Emitted when either you or the remote peer closes the data connection.
@@ -818,15 +1068,23 @@ export class User {
   }
 
   async _onFileAdd(files) {
+    if (!Array.isArray(files)) return;
     let data = []
     for (const file of files) {
-      // Create file instance with received data
+      // Reject malformed entries from the network. id fields are used as DOM id
+      // suffixes and in inline event handlers; name fields are rendered in the DOM and
+      // must be length-bounded. size must be a non-negative number.
+      if (!file || typeof file !== 'object') continue;
+      if (!_isValidId(file.id) || !_isValidId(file.owner_id)) continue;
+      if (typeof file.size !== 'number' || !Number.isFinite(file.size) || file.size < 0) continue;
+      if (file.id in this._files) continue; // Don't accept duplicates from the wire.
+
       const fileData = {
         "id": file.id,
-        "name": file.name,
+        "name": _sanitizeName(file.name, _MAX_FILENAME_LEN),
         "size": file.size,
         "owner_id": file.owner_id,
-        "owner_name": file.owner_name,
+        "owner_name": _sanitizeName(file.owner_name),
       };
 
       // Create file instance
@@ -854,14 +1112,92 @@ export class User {
   }
 
   async _onFileDownload(data) {
-    // If the current peer is the owner of the file
-    if (this._files[data.file_id].owner_id == this._peer.id) {
-      this._files[data.file_id].transfer(data)
+    const file = this._files[data.file_id];
+    if (!file) return;
+
+    // I'm the owner — run with the concurrency cap.
+    if (file.owner_id == this._peer.id) {
+      if (this._outboundActive >= _OUTBOUND_CONCURRENCY_CAP) {
+        // Capacity reached — queue this request and tell the requester they're waiting.
+        this._outboundQueue.push(data);
+        this._notifyQueued(data);
+        return;
+      }
+      this._startOutboundTransfer(file, data);
+      return;
     }
-    // Redirect
-    else {
-      const owner_id = this._files[data.file_id].owner_id
-      this._remotePeers[owner_id].conn.send({"webrtc-file-download": data})
+
+    // Not the owner — forward to whoever is (only the host has this routing role).
+    const owner_id = file.owner_id;
+    const target = this._remotePeers[owner_id];
+    if (target && target.conn) target.conn.send({"webrtc-file-download": data});
+  }
+
+  // Start a transfer and account for its slot. The slot is released via `.finally` so
+  // any exit (success, error, abort, peer-disconnect) frees capacity correctly. The
+  // `.catch` is what makes that promise actually settle when file.connect() rejects:
+  // without it, an unreachable receiver would silently leak the slot until the cap
+  // permanently rejected all further outbound transfers.
+  _startOutboundTransfer(file, data) {
+    this._outboundActive += 1;
+    file.transfer(data)
+      .catch((err) => {
+        console.warn('Outbound transfer failed for', data?.file_id, '-', err?.message || err);
+        // Best-effort: tear down any per-receiver state file.transfer set up before it
+        // failed, so we don't leak the signaling WebSocket attached to the per-file Peer.
+        const entry = file._remotePeers?.[data?.peer_id];
+        if (entry) {
+          try { entry.peer?.destroy() } catch {}
+          if (entry.interval) clearInterval(entry.interval);
+          delete file._remotePeers[data.peer_id];
+        }
+      })
+      .finally(() => {
+        this._outboundActive = Math.max(0, this._outboundActive - 1);
+        this._dequeueOutbound();
+      });
+  }
+
+  // Pop and start as many queued transfers as the cap allows. Skips entries whose
+  // file has been removed in the meantime.
+  _dequeueOutbound() {
+    while (this._outboundActive < _OUTBOUND_CONCURRENCY_CAP && this._outboundQueue.length > 0) {
+      const next = this._outboundQueue.shift();
+      const file = this._files[next.file_id];
+      if (!file || file.removed) continue;
+      this._startOutboundTransfer(file, next);
+    }
+  }
+
+  // Tell the requester their download is queued behind other transfers. The message
+  // routes the same way the inbound webrtc-file-download did, in reverse:
+  //   - if I'm the host, send directly to the requester
+  //   - otherwise send to the host, which forwards (see _onFileQueued below)
+  _notifyQueued(data) {
+    const payload = { file_id: data.file_id, requester_id: data.requester_id };
+    if (this._isHost) {
+      const target = this._remotePeers[data.requester_id];
+      if (target && target.conn) target.conn.send({ 'webrtc-file-queued': payload });
+    } else {
+      const host = this._remotePeers[this._room_id];
+      if (host && host.conn) host.conn.send({ 'webrtc-file-queued': payload });
+    }
+  }
+
+  // Inbound webrtc-file-queued. Either I am the requester (update UI) or I'm the host
+  // and need to forward it to the requester.
+  _onFileQueued(data) {
+    if (!data || !_isValidId(data.file_id) || !_isValidId(data.requester_id)) return;
+    if (data.requester_id == this._peer.id) {
+      // Update the file row's progress label so the user sees a real state, not a
+      // silent 0%.
+      const el = document.getElementById(`file-${data.file_id}-progress`);
+      if (el) el.textContent = 'Queued | ';
+      return;
+    }
+    if (this._isHost) {
+      const target = this._remotePeers[data.requester_id];
+      if (target && target.conn) target.conn.send({ 'webrtc-file-queued': data });
     }
   }
 
@@ -874,7 +1210,7 @@ export class User {
     document.getElementById(`file-${data.file_id}-icon-loading`).style.display = 'none'
     document.getElementById(`file-${data.file_id}-icon-failed`).style.display = 'none'
     document.getElementById(`file-${data.file_id}-error`).style.display = 'block' 
-    document.getElementById(`file-${data.file_id}-error`).innerHTML = 'This file has been remove it.'
+    document.getElementById(`file-${data.file_id}-error`).innerHTML = 'This file has been removed.'
 
     // Send file to all peers excluding the peer that has sent the file
     if (this._isHost) {
@@ -888,7 +1224,8 @@ export class User {
   }
 
   _addUserUI(user) {
-    // Add new user
+    // user.id is validated at every entry point; safe in id attributes. user.name is
+    // user-controlled and inserted via textContent below — never via innerHTML.
     let li = document.createElement('li')
     li.setAttribute('id', `user-${user.id}`)
     li.setAttribute('class', 'list-group-item')
@@ -898,9 +1235,11 @@ export class User {
           <path d="M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"/>
         </svg>
       </span>
-      <span id="user-${user.id}-name">${user.id == this._peer.id ? `${user.name} (You)` : user.name}</span>
+      <span id="user-${user.id}-name"></span>
     `
     dom.transfer_users_list.appendChild(li)
+    const nameEl = document.getElementById(`user-${user.id}-name`);
+    if (nameEl) nameEl.textContent = user.id == this._peer.id ? `${user.name} (You)` : user.name;
 
     // Update the number of users in the list
     dom.transfer_users_count.innerHTML = ` (${dom.transfer_users_list.querySelectorAll('li').length})`
@@ -924,17 +1263,20 @@ export class User {
   }
 
   _addFileUI(file) {
-    // Add file to the list
+    // file.id is validated as a strict id at every entry point; safe to use as a DOM id
+    // suffix and in onclick attributes. file.name and file.owner_name are user-controlled
+    // and inserted via textContent below — never via innerHTML.
     dom.transfer_files_list_empty.remove()
     let li = document.createElement('li')
-    li.setAttribute('id', `file-${this._peer.id}`)
+    li.setAttribute('id', `file-${file.id}`)
     li.setAttribute('class', 'list-group-item')
-  
+
+    const isMine = file.owner_id == this._peer.id;
     li.innerHTML = `
       <div class="row align-items-center">
         <div class="col-auto" style="padding-right: 0">
-          <div id="file-${file.id}-icon-loading" title="${file.owner_id == this._peer.id ? 'Uploading file': 'Downloading file'}" class="col-auto spinner-border" style="margin-right: 12px; color: #0d6efd; width: 1.4rem; height: 1.4rem; --bs-spinner-border-width: 0.15em; margin-top:3px; display: none"></div>
-          <div id="file-${file.id}-icon-success" title="${file.owner_id == this._peer.id ? 'File uploaded': 'File downloaded'}" style="margin-right: 12px; display: none">
+          <div id="file-${file.id}-icon-loading" title="${isMine ? 'Uploading file': 'Downloading file'}" class="col-auto spinner-border" style="margin-right: 12px; color: #0d6efd; width: 1.4rem; height: 1.4rem; --bs-spinner-border-width: 0.15em; margin-top:3px; display: none"></div>
+          <div id="file-${file.id}-icon-success" title="${isMine ? 'File uploaded': 'File downloaded'}" style="margin-right: 12px; display: none">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="#198754" class="bi bi-check-circle-fill" viewBox="0 0 16 16">
               <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/>
             </svg>
@@ -945,22 +1287,22 @@ export class User {
             </svg>
           </div>
         </div>
-  
+
         <div class="col d-flex flex-column" style="overflow-x: hidden; padding-left:0px;">
           <div style="margin-bottom: 5px; font-size: 0.875rem; font-weight: 500; text-align: left; word-break: break-all;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" class="bi bi-arrow-up-short" viewBox="0 0 16 16"; style="margin-top:-3px; margin-right:-3px; margin-left:-5px; display: ${file.owner_id == this._peer.id ? 'block-inline' : 'none'}">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" class="bi bi-arrow-up-short" viewBox="0 0 16 16"; style="margin-top:-3px; margin-right:-3px; margin-left:-5px; display: ${isMine ? 'block-inline' : 'none'}">
             <path fill-rule="evenodd" d="M8 12a.5.5 0 0 0 .5-.5V5.707l2.146 2.147a.5.5 0 0 0 .708-.708l-3-3a.5.5 0 0 0-.708 0l-3 3a.5.5 0 1 0 .708.708L7.5 5.707V11.5a.5.5 0 0 0 .5.5z"/>
           </svg>
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" class="bi bi-arrow-down-short" viewBox="0 0 16 16" style="margin-top:-3px; margin-right:-3px; margin-left:-5px; display: ${file.owner_id == this._peer.id ? 'none' : 'block-inline'}">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" class="bi bi-arrow-down-short" viewBox="0 0 16 16" style="margin-top:-3px; margin-right:-3px; margin-left:-5px; display: ${isMine ? 'none' : 'block-inline'}">
             <path fill-rule="evenodd" d="M8 4a.5.5 0 0 1 .5.5v5.793l2.146-2.147a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 1 1 .708-.708L7.5 10.293V4.5A.5.5 0 0 1 8 4z"/>
           </svg>
-          ${file.name}</div>
-          <div style="color: #636979; font-size: .9rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; margin-bottom:1px"><span id="file-${file.id}-progress"></span><span id="file-${file.id}-info">${this._parseBytes(file.size)} | Sent by ${file.owner_id == this._peer.id ? `${file.owner_name} (You)` : file.owner_name }</span></div>
+          <span id="file-${file.id}-name"></span></div>
+          <div style="color: #636979; font-size: .9rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; margin-bottom:1px"><span id="file-${file.id}-progress"></span><span id="file-${file.id}-info"></span></div>
           <div id="file-${file.id}-error" style="color: #dc3545; font-size: .9rem; font-weight: 500; overflow-x: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; margin-top:5px; margin-bottom:4px; display:none"></div>
-          <div id="file-${file.id}-details" onclick="showFileDetails('${file.id}')" style="color: #0d6efd; font-size: .9rem; font-weight: 500; text-align: left; padding-top:5px; padding-bottom:4px; padding-right:4px; cursor:pointer; display: ${file.owner_id == this._peer.id ? 'block' : 'none'}">See details</div>
+          <div id="file-${file.id}-details" onclick="showFileDetails('${file.id}')" style="color: #0d6efd; font-size: .9rem; font-weight: 500; text-align: left; padding-top:5px; padding-bottom:4px; padding-right:4px; cursor:pointer; display: ${isMine ? 'block' : 'none'}">See details</div>
         </div>
 
-        <div id="file-${file.id}-remove" onclick="removeFile('${file.id}')" class="col-auto text-end" title="Remove file" style="cursor: pointer; display: ${file.owner_id == this._peer.id ? 'block-inline' : 'none'}">
+        <div id="file-${file.id}-remove" onclick="removeFile('${file.id}')" class="col-auto text-end" title="Remove file" style="cursor: pointer; display: ${isMine ? 'block-inline' : 'none'}">
           <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" fill="#dc3545" class="bi bi-x-circle" viewBox="0 0 16 16">
             <path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/>
             <path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/>
@@ -972,7 +1314,7 @@ export class User {
             <path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/>
           </svg>
         </div>
-        <div id="file-${file.id}-download" onclick="downloadFile('${file.id}')" class="col-auto text-end" title="Download file" style="cursor: pointer; display: ${file.owner_id == this._peer.id ? 'none' : 'block-inline'}">
+        <div id="file-${file.id}-download" onclick="downloadFile('${file.id}')" class="col-auto text-end" title="Download file" style="cursor: pointer; display: ${isMine ? 'none' : 'block-inline'}">
           <svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" fill="#0d6efd" class="bi bi-arrow-down-circle" viewBox="0 0 16 16">
             <path fill-rule="evenodd" d="M1 8a7 7 0 1 0 14 0A7 7 0 0 0 1 8zm15 0A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.5 4.5a.5.5 0 0 0-1 0v5.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V4.5z"/>
           </svg>
@@ -981,8 +1323,24 @@ export class User {
     `
     dom.transfer_files_list.appendChild(li)
 
-    // Update the number of files in the list
-    dom.transfer_files_count.innerHTML = ` (${dom.transfer_files_list.querySelectorAll('li').length})`
+    // Insert user-controlled text safely (textContent never parses HTML).
+    const nameEl = document.getElementById(`file-${file.id}-name`);
+    if (nameEl) nameEl.textContent = file.name;
+    this._setFileInfoText(file);
+
+    // Update the number of files in the list (count is server-derived, but use
+    // textContent for consistency).
+    dom.transfer_files_count.textContent = ` (${dom.transfer_files_list.querySelectorAll('li').length})`;
+  }
+
+  // Renders the "{size} | Sent by {owner_name}" caption for a file. owner_name is
+  // user-controlled and must be inserted via textContent — never via innerHTML.
+  _setFileInfoText(file) {
+    const el = document.getElementById(`file-${file.id}-info`);
+    if (!el) return;
+    const isMine = file.owner_id == this._peer.id;
+    const ownerLabel = isMine ? `${file.owner_name} (You)` : file.owner_name;
+    el.textContent = `${this._parseBytes(file.size)} | Sent by ${ownerLabel}`;
   }
 
   _generate_name() {

@@ -1,28 +1,39 @@
 import os
+import time
 import hmac
 import hashlib
 import base64
-import time
-import jwt
 import uuid
+import jwt
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Get environment variables
+from api.signaling import router as signaling_router
+
+# Get environment variables. SECRET_KEY signs both the TURN HMAC credentials and the JWT,
+# so refuse to start without it rather than failing later at request time.
 SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY or SECRET_KEY == "<SECRET_KEY>":
+    # Also reject the compose files' literal placeholder — it is a publicly known
+    # value, so running with it would silently let anyone mint TURN credentials.
+    raise RuntimeError("SECRET_KEY environment variable is required (replace the <SECRET_KEY> placeholder with a real secret).")
 
 # Init FastAPI
-app = FastAPI(title='FileSync API', version='3.7.0', root_path="/api")
+app = FastAPI(title='FileSync API', version='4.0.0', root_path="/api")
 
-# Allow your dev frontend origin
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is only needed when the frontend is served from a different origin than the API
+# (i.e. local development). In production everything is same-origin behind the reverse
+# proxy, so this stays off unless CORS_ORIGINS is explicitly set (comma-separated).
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Add root route
 @app.get("/")
@@ -62,3 +73,6 @@ def generate_turn_credentials(ttl):
     dig = hmac.new(SECRET_KEY.encode(), username.encode(), hashlib.sha1).digest()
     password = base64.b64encode(dig).decode()
     return username, password
+
+# Mount WebRTC signaling routes (/ws). Implementation lives in api/signaling.py.
+app.include_router(signaling_router)
