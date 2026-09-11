@@ -10,7 +10,7 @@
 
 <br>
 
-![FileSync](web/assets/filesync.png?v=4.0.0)
+![FileSync](web/assets/filesync.png?v=4.1.0)
 
 </div>
 
@@ -97,6 +97,7 @@ Caddy obtains and renews a Let's Encrypt certificate automatically. HTTPS also u
 
 ```caddyfile
 filesync.example.com {
+    header Strict-Transport-Security "max-age=31536000; include-subdomains"
     reverse_proxy filesync:80
 }
 ```
